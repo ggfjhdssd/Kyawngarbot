@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: kyawngar-mining-bot
+    env: node
+    buildCommand: npm install
+    startCommand: node bot.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: API_BASE_URL
+        sync: false
+      - key: WEB_APP_URL
+        sync: false
