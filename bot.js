@@ -57,7 +57,7 @@ async function sendWelcome(chatId, firstName, refParam) {
   await bot.sendMessage(chatId,
     `မင်္ဂလာပါ *${firstName}* ခင်ဗျာ! 🙏\n` +
     `Kyaw Ngar Mining မှ ကြိုဆိုပါတယ်။\n\n` +
-    `⛏️ *Miner ဝယ်ယူ:* ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် Auto ရှာပေးမည်\n` +
+    `⛏️ *Miner ဝယ်ယူ:* ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရှာပေးမည်\n` +
     `📺 *Tasks:* ကြော်ငြာကြည့်ပြီး ၃၀၀ ကျပ် ရယူပါ\n` +
     `👥 *Referral:* တစ်ယောက်ဖိတ်ပြီး ၂,၀၀၀ ကျပ် ရပါ\n` +
     `💸 *Withdraw:* ၅၀,၀၀၀ ကျပ် ပြည့်ပါက ထုတ်ယူနိုင်သည်\n\n` +
@@ -116,9 +116,14 @@ async function awardReferral(inviteeId, inviteeName, refCode) {
 }
 
 // ── Backend API helper ─────────────────────────────────────────
+const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY || 'kyawngar_internal_bot_key';
+
 async function backendPost(path, body) {
   try {
-    const r = await axios.post(`${API_BASE_URL}${path}`, body, { timeout: 10000 });
+    const r = await axios.post(`${API_BASE_URL}${path}`, body, {
+      timeout: 10000,
+      headers: { 'x-bot-key': BOT_INTERNAL_KEY }
+    });
     return r.data;
   } catch (e) {
     console.warn(`backendPost ${path}:`, e.response?.data || e.message);
@@ -128,7 +133,10 @@ async function backendPost(path, body) {
 
 async function backendGet(path) {
   try {
-    const r = await axios.get(`${API_BASE_URL}${path}`, { timeout: 10000 });
+    const r = await axios.get(`${API_BASE_URL}${path}`, {
+      timeout: 10000,
+      headers: { 'x-bot-key': BOT_INTERNAL_KEY }
+    });
     return r.data;
   } catch (e) {
     console.warn(`backendGet ${path}:`, e.message);
@@ -264,7 +272,7 @@ function setupHandlers() {
         bot.sendMessage(mUserId,
           `✅ *Miner #${slot} Activate ပြုလုပ်ပြီးပါပြီ!*\n\n` +
           `Admin မှ သင့် Miner ကို confirm ပေးပါပြီ။\n` +
-          `ယခု ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် Auto ရရှိနေပါမည်! ⛏️💰`,
+          `ယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရရှိနေပါမည်! ⛏️💰`,
           { parse_mode: 'Markdown' }
         ).catch(() => {});
       } else {
@@ -499,6 +507,50 @@ function setupHandlers() {
     bot.sendMessage(msg.chat.id,
       `✅ Broadcast ပြီးပါပြီ\n📤 Sent: ${ok}\n❌ Failed: ${fail}`
     ).catch(() => {});
+  });
+
+  // /giveminer [userId] [slot] — Grant miner to user
+  bot.onText(/\/giveminer (\d+) ([123])/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId  = parseInt(match[1]);
+    const slotIndex = parseInt(match[2]);
+
+    const res = await backendPost('/api/admin/bot/giveminer', { userId: targetId, slotIndex });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *Miner Slot #${slotIndex} ပေးပြီးပါပြီ*\n` +
+        `👤 User: ${targetId}\n` +
+        `⛏️ Slot #${slotIndex} Active ဖြစ်ပြီ!`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      // Notify user
+      bot.sendMessage(targetId,
+        `🎁 *Admin မှ Miner ပေးပါပြီ!*\n\n` +
+        `⛏️ *Slot #${slotIndex}* သင့်အတွက် Activate ပြုလုပ်ပြီးပါပြီ\n` +
+        `ယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရရှိနေပါမည်! 💰`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'Error ဖြစ်သွားသည်'}`).catch(() => {});
+    }
+  });
+
+  // /revokeminer [userId] [slot] — Remove miner from user
+  bot.onText(/\/revokeminer (\d+) ([123])/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId  = parseInt(match[1]);
+    const slotIndex = parseInt(match[2]);
+
+    const res = await backendPost('/api/admin/bot/revokeminer', { userId: targetId, slotIndex });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *Miner Slot #${slotIndex} ဖြုတ်ပြီးပါပြီ*\n👤 User: ${targetId}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'Miner မတွေ့ပါ'}`).catch(() => {});
+    }
   });
 
   // ── Non-command messages ────────────────────────────────────
