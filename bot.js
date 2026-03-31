@@ -1,491 +1,635 @@
-const TelegramBot = require('node-telegram-bot-api');
-const express = require('express');
-const axios = require('axios');
+/**
+ * ============================================================
+ *  KYAW NGAR MINING BOT  —  bot.js  (ပြင်ဆင်ထားသောဗားရှင်း)
+ *  ✅ Referral: Channel join ပြီးတာနဲ့ ချက်ချင်း 2000 ကျပ် + Noti
+ *  ✅ Miner purchase: Frontend မှ multer screenshot → Admin sendPhoto
+ *                     Approve/Reject inline button ဖြင့် User Noti
+ *  ✅ Admin commands: /addmoney /reducemoney /ban /unban
+ * ============================================================
+ */
 
-// ==================== Configuration ====================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = parseInt(process.env.ADMIN_ID);
-const API_BASE_URL = process.env.API_BASE_URL || 'https://kyawngar-backend.onrender.com';
-const WEB_APP_URL = process.env.WEB_APP_URL || 'https://kyawngarfrontend1.vercel.app';
-const CHANNEL_LINK = 'https://t.me/freeeemoneeeyi';
-const CHANNEL_USERNAME = '@freeeemoneeeyi';
-const INVITE_REWARD = 2000;
+const TelegramBot = require('node-telegram-bot-api');
+const express     = require('express');
+const axios       = require('axios');
+
+// ── Config ────────────────────────────────────────────────────
+const BOT_TOKEN      = process.env.BOT_TOKEN;
+const ADMIN_ID       = parseInt(process.env.ADMIN_ID);
+const API_BASE_URL   = process.env.API_BASE_URL  || 'https://kyawngar-backend.onrender.com';
+const WEB_APP_URL    = process.env.WEB_APP_URL   || 'https://kyawngarfrontend1.vercel.app';
+const CHANNEL_LINK   = process.env.CHANNEL_LINK  || 'https://t.me/freeeemoneeeyi';
+const CHANNEL_ID     = process.env.CHANNEL_ID    || '@freeeemoneeeyi';
+const INVITE_REWARD  = 2000;
 
 if (!BOT_TOKEN || !ADMIN_ID) {
-    console.error('❌ Missing BOT_TOKEN or ADMIN_ID!');
-    process.exit(1);
+  console.error('❌ Missing BOT_TOKEN or ADMIN_ID!');
+  process.exit(1);
 }
 
-// ==================== Global Variables ====================
-let bot;
-let isPolling = false;
-let restartAttempts = 0;
-const MAX_RESTART_ATTEMPTS = 5;
+// ── State ─────────────────────────────────────────────────────
+let bot, isPolling = false, restartAttempts = 0;
+const MAX_RESTART = 5;
 
-// ==================== Force clear webhook ====================
+// ── Helpers ───────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function forceClearWebhook() {
-    try {
-        console.log('🔄 Force clearing webhook...');
-        const res = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`);
-        console.log('✅ Webhook cleared:', res.data.description);
-        return true;
-    } catch (err) {
-        console.error('❌ Failed to clear webhook:', err.message);
-        return false;
-    }
+  try {
+    const r = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`);
+    console.log('✅ Webhook cleared:', r.data.description);
+  } catch (e) {
+    console.error('❌ clearWebhook error:', e.message);
+  }
 }
 
-// ==================== Check Channel Membership ====================
 async function isChannelMember(userId) {
-    try {
-        const res = await axios.get(
-            `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`,
-            { params: { chat_id: CHANNEL_USERNAME, user_id: userId } }
-        );
-        const status = res.data.result?.status;
-        return ['member', 'administrator', 'creator'].includes(status);
-    } catch (err) {
-        console.error('Channel check error:', err.message);
-        return false;
-    }
-}
-
-// ==================== Send Welcome Message ====================
-async function sendWelcomeMessage(chatId, firstName, referrerId) {
-    let webAppUrl = WEB_APP_URL;
-    if (referrerId) {
-        webAppUrl = `${WEB_APP_URL}?startapp=${referrerId}`;
-    }
-
-    const text =
-        `မင်္ဂလာပါ ${firstName} ခင်ဗျာ! 🙏\n` +
-        `Kyaw Ngar Mining မှ ကြိုဆိုပါတယ်။\n\n` +
-        `ကျွန်ုပ်တို့၏ Mini App တွင် အောက်ပါတို့ကို လုပ်ဆောင်ပြီး ငွေရှာနိုင်ပါသည်\n\n` +
-        `⛏️ Miner ဝယ်ယူခြင်း: ၁၀ မိနစ်လျှင် ၃၀၀ ကျပ် နှုန်းဖြင့် အလိုအလျောက် ငွေရှာပေးမည်\n\n` +
-        `📺 Tasks: ကြော်ငြာကြည့်ပြီး တစ်ကြိမ်လျှင် ၃၀၀ ကျပ် ရယူပါ။\n\n` +
-        `👥 Referral: သူငယ်ချင်းကို ဖိတ်ခေါ်ပြီး တစ်ယောက်လျှင် ၂၀၀၀ ကျပ် လက်ဆောင်ရယူပါ။\n\n` +
-        `💸 Withdraw: အနည်းဆုံး ၅၀,၀၀၀ ကျပ် ပြည့်ပါက KPay / WavePay ဖြင့် ထုတ်ယူနိုင်ပါသည်\n\n` +
-        `အောက်က "Open App" ခလုတ်ကိုနှိပ်ပြီး အခုပဲ စတင်လိုက်ပါ။ 👇`;
-
-    await bot.sendMessage(chatId, text, {
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '🚀 Open App', web_app: { url: webAppUrl } }]
-            ]
-        }
+  try {
+    const r = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+      params: { chat_id: CHANNEL_ID, user_id: userId }
     });
+    return ['member', 'administrator', 'creator'].includes(r.data.result?.status);
+  } catch { return false; }
 }
 
-// ==================== Initialize Bot ====================
+// ── Welcome message ───────────────────────────────────────────
+async function sendWelcome(chatId, firstName, refParam) {
+  const url = refParam ? `${WEB_APP_URL}?startapp=${refParam}` : WEB_APP_URL;
+  await bot.sendMessage(chatId,
+    `မင်္ဂလာပါ *${firstName}* ခင်ဗျာ! 🙏\n` +
+    `Kyaw Ngar Mining မှ ကြိုဆိုပါတယ်။\n\n` +
+    `⛏️ *Miner ဝယ်ယူ:* ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် Auto ရှာပေးမည်\n` +
+    `📺 *Tasks:* ကြော်ငြာကြည့်ပြီး ၃၀၀ ကျပ် ရယူပါ\n` +
+    `👥 *Referral:* တစ်ယောက်ဖိတ်ပြီး ၂,၀၀၀ ကျပ် ရပါ\n` +
+    `💸 *Withdraw:* ၅၀,၀၀၀ ကျပ် ပြည့်ပါက ထုတ်ယူနိုင်သည်\n\n` +
+    `👇 App ဖွင့်ပြီး စတင်ပါ`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[{ text: '🚀 Open App', web_app: { url } }]]
+      }
+    }
+  ).catch(() => {});
+}
+
+// ── Send channel-join prompt (with referral embedded in callback) ─
+async function sendJoinPrompt(chatId, firstName, refCode) {
+  // Embed refCode in callback_data so it survives the join step
+  const cbData = refCode ? `joined_${chatId}_${refCode}` : `joined_${chatId}_`;
+  await bot.sendMessage(chatId,
+    `မင်္ဂလာပါ *${firstName}* ✋\n\n` +
+    `⚠️ App ကို အသုံးပြုရန် ကျွန်ုပ်တို့ Channel ကို အရင် *Join* ဖြစ်ရပါမည်!\n\n` +
+    `📢 Join ပြီးမှ ✅ ခလုတ်နှိပ်ပါ`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📢 Channel Join မည်', url: CHANNEL_LINK }],
+          [{ text: '✅ Join ပြီးပြီ — ဆက်သွားမည်', callback_data: cbData }]
+        ]
+      }
+    }
+  ).catch(() => {});
+}
+
+// ── Award referral (idempotent) ───────────────────────────────
+async function awardReferral(inviteeId, inviteeName, refCode) {
+  if (!refCode) return;
+  try {
+    const res = await axios.post(`${API_BASE_URL}/api/bot/referral-award`, {
+      inviteeId, inviteeName, refCode
+    }, { timeout: 8000 });
+
+    if (res.data?.success && res.data?.referrerId) {
+      const referrerId = res.data.referrerId;
+      const reward     = res.data.reward || INVITE_REWARD;
+      // Send notification to referrer
+      await bot.sendMessage(referrerId,
+        `🎉 *သင်၏ Referral Link မှ လူသစ်တစ်ယောက် ဝင်ရောက်လာပါပြီ!*\n\n` +
+        `👤 *${inviteeName}* သည် သင့် link မှတစ်ဆင့် ဝင်ရောက်လာသောကြောင့်\n` +
+        `💰 *${reward.toLocaleString()} ကျပ်* သင့်အကောင့်သို့ ချက်ချင်းထည့်သွင်းပြီးပါပြီ!`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+  } catch (e) {
+    console.warn('awardReferral error:', e.message);
+  }
+}
+
+// ── Backend API helper ─────────────────────────────────────────
+async function backendPost(path, body) {
+  try {
+    const r = await axios.post(`${API_BASE_URL}${path}`, body, { timeout: 10000 });
+    return r.data;
+  } catch (e) {
+    console.warn(`backendPost ${path}:`, e.response?.data || e.message);
+    return null;
+  }
+}
+
+async function backendGet(path) {
+  try {
+    const r = await axios.get(`${API_BASE_URL}${path}`, { timeout: 10000 });
+    return r.data;
+  } catch (e) {
+    console.warn(`backendGet ${path}:`, e.message);
+    return null;
+  }
+}
+
+// ============================================================
+//  INITIALIZE BOT
+// ============================================================
 async function initializeBot() {
-    console.log('🚀 Initializing bot...');
-    await forceClearWebhook();
-    await new Promise(resolve => setTimeout(resolve, 3000));
+  console.log('🚀 Initializing bot...');
+  await forceClearWebhook();
+  await sleep(3000);
+
+  bot = new TelegramBot(BOT_TOKEN, {
+    polling: { interval: 300, autoStart: true, params: { timeout: 10 } }
+  });
+  isPolling = true;
+  restartAttempts = 0;
+
+  const me = await bot.getMe();
+  console.log(`🤖 Bot ready: @${me.username}`);
+
+  setupHandlers();
+}
+
+// ============================================================
+//  HANDLERS
+// ============================================================
+function setupHandlers() {
+
+  // ── /start ────────────────────────────────────────────────
+  bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+    const chatId    = msg.chat.id;
+    const userId    = msg.from.id;
+    const firstName = msg.from.first_name || 'User';
+    const refCode   = match[1]?.trim() || '';
+
     try {
-        bot = new TelegramBot(BOT_TOKEN, { polling: true, onlyFirstMatch: true });
-        isPolling = true;
-        restartAttempts = 0;
-        console.log('✅ Bot polling started');
-        setupCommandHandlers();
-        const me = await bot.getMe();
-        console.log(`🤖 Bot connected: @${me.username}`);
-    } catch (err) {
-        console.error('❌ Failed to initialize bot:', err.message);
-        throw err;
+      const joined = await isChannelMember(userId);
+
+      if (!joined) {
+        // Persist pending ref code to backend so it survives restarts
+        await backendPost('/api/bot/save-pending-ref', {
+          userId, firstName,
+          username: msg.from.username || '',
+          refCode: refCode || null
+        }).catch(() => {});
+        await sendJoinPrompt(chatId, firstName, refCode);
+        return;
+      }
+
+      // Already a member — process referral immediately
+      if (refCode) {
+        await awardReferral(userId, firstName, refCode);
+      }
+      await sendWelcome(chatId, firstName, refCode);
+
+    } catch (e) {
+      console.error('/start error:', e.message);
+      bot.sendMessage(chatId, '❌ တစ်ခုခု မှားသွားပါသည်။ ထပ်ကြိုးစားပါ။').catch(() => {});
     }
+  });
+
+  // ── Callback queries (Join check, Miner Approve/Reject) ───
+  bot.on('callback_query', async (cb) => {
+    const chatId    = cb.message?.chat?.id;
+    const userId    = cb.from?.id;
+    const firstName = cb.from?.first_name || 'User';
+    const data      = cb.data || '';
+
+    await bot.answerCallbackQuery(cb.id).catch(() => {});
+
+    // ── "joined_{userId}_{refCode}" ─────────────────────────
+    if (data.startsWith('joined_')) {
+      const parts   = data.split('_');
+      // Format: joined_{targetUserId}_{refCode}
+      // parts[0]=joined, parts[1]=targetUserId, rest=refCode
+      const targetId = parseInt(parts[1]);
+      const refCode  = parts.slice(2).join('_') || '';
+
+      // Only respond to the user whose button it is
+      if (userId !== targetId) {
+        return bot.answerCallbackQuery(cb.id, { text: '❌ သင့်ခလုတ် မဟုတ်ပါ', show_alert: true }).catch(() => {});
+      }
+
+      const joined = await isChannelMember(userId);
+      if (!joined) {
+        return bot.answerCallbackQuery(cb.id, {
+          text: '❌ Channel ကို Join မလုပ်ရသေးပါ! Join လုပ်ပြီးမှ ထပ်နှိပ်ပါ။',
+          show_alert: true
+        }).catch(() => {});
+      }
+
+      // Delete the join-prompt message
+      bot.deleteMessage(chatId, cb.message.message_id).catch(() => {});
+
+      // Retrieve saved pending ref from backend (fallback)
+      let codeToUse = refCode;
+      if (!codeToUse) {
+        const saved = await backendGet(`/api/bot/pending-ref/${userId}`);
+        codeToUse = saved?.refCode || '';
+      }
+
+      if (codeToUse) {
+        await awardReferral(userId, firstName, codeToUse);
+      }
+
+      // Clear pending ref
+      await backendPost('/api/bot/clear-pending-ref', { userId }).catch(() => {});
+      await sendWelcome(chatId, firstName, codeToUse);
+      return;
+    }
+
+    // ── "miner_approve_{minerId}_{userId}_{slot}" ────────────
+    if (data.startsWith('miner_approve_')) {
+      if (userId !== ADMIN_ID) return;
+      const parts   = data.replace('miner_approve_', '').split('_');
+      const minerId = parts[0];
+      const mUserId = parseInt(parts[1]);
+      const slot    = parts[2] || '?';
+
+      const res = await backendPost('/api/admin/bot/miners/approve', { minerId });
+      if (res?.success) {
+        // Edit the admin message caption
+        bot.editMessageCaption(
+          cb.message?.caption?.replace(/\n\n_Approve.*$/s, '') + '\n\n✅ *APPROVED*',
+          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+        ).catch(() => {});
+
+        // Notify user
+        bot.sendMessage(mUserId,
+          `✅ *Miner #${slot} Activate ပြုလုပ်ပြီးပါပြီ!*\n\n` +
+          `Admin မှ သင့် Miner ကို confirm ပေးပါပြီ။\n` +
+          `ယခု ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် Auto ရရှိနေပါမည်! ⛏️💰`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      } else {
+        bot.answerCallbackQuery(cb.id, { text: '❌ Error: ' + (res?.error || 'Server error'), show_alert: true }).catch(() => {});
+      }
+      return;
+    }
+
+    // ── "miner_reject_{minerId}_{userId}_{slot}" ─────────────
+    if (data.startsWith('miner_reject_')) {
+      if (userId !== ADMIN_ID) return;
+      const parts   = data.replace('miner_reject_', '').split('_');
+      const minerId = parts[0];
+      const mUserId = parseInt(parts[1]);
+      const slot    = parts[2] || '?';
+
+      const res = await backendPost('/api/admin/bot/miners/reject', { minerId });
+      if (res?.success) {
+        bot.editMessageCaption(
+          cb.message?.caption?.replace(/\n\n_Approve.*$/s, '') + '\n\n❌ *REJECTED*',
+          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+        ).catch(() => {});
+
+        bot.sendMessage(mUserId,
+          `❌ *Miner #${slot} ငြင်းဆန်ခံရပါသည်။*\n\n` +
+          `Screenshot မှန်ကန်မှု စစ်ဆေးပြီး ထပ်မံ တင်ပေးပါ။`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
+      return;
+    }
+  });
+
+  // ── Admin commands ─────────────────────────────────────────
+
+  // /admin — help list
+  bot.onText(/\/admin$/, async (msg) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    bot.sendMessage(msg.chat.id,
+      `🛠 *Admin Commands*\n\n` +
+      `/addmoney [UserID] [Amount] — ငွေထည့်ရန်\n` +
+      `/reducemoney [UserID] [Amount] — ငွေနုတ်ရန်\n` +
+      `/ban [UserID] [Reason] — User ပိတ်ရန်\n` +
+      `/unban [UserID] — User ပြန်ဖွင့်ရန်\n` +
+      `/userinfo [UserID] — User အချက်အလက်\n` +
+      `/broadcast [message] — Users အားလုံးသို့ Noti\n` +
+      `/reply [UserID] [message] — User ထံ စာပြန်ရန်\n` +
+      `/stats — App statistics`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  });
+
+  // /addmoney [userId] [amount]
+  bot.onText(/\/addmoney (\d+) (\d+)/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId = parseInt(match[1]);
+    const amount   = parseInt(match[2]);
+
+    const res = await backendPost('/api/admin/bot/addmoney', { userId: targetId, amount });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *ငွေထည့်ပြီးပါပြီ*\n` +
+        `👤 User: ${targetId}\n` +
+        `💰 ထည့်သော ငွေ: ${amount.toLocaleString()} ကျပ်\n` +
+        `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      // Notify target user
+      bot.sendMessage(targetId,
+        `💰 *Admin မှ ငွေထည့်ပေးပါပြီ!*\n\n` +
+        `✅ ${amount.toLocaleString()} ကျပ် သင့်အကောင့်သို့ ထည့်သွင်းပြီးပါပြီ\n` +
+        `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`).catch(() => {});
+    }
+  });
+
+  // /reducemoney [userId] [amount]
+  bot.onText(/\/reducemoney (\d+) (\d+)/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId = parseInt(match[1]);
+    const amount   = parseInt(match[2]);
+
+    const res = await backendPost('/api/admin/bot/reducemoney', { userId: targetId, amount });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *ငွေနုတ်ပြီးပါပြီ*\n` +
+        `👤 User: ${targetId}\n` +
+        `💸 နုတ်သော ငွေ: ${amount.toLocaleString()} ကျပ်\n` +
+        `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      bot.sendMessage(targetId,
+        `⚠️ *Admin မှ ငွေနုတ်ယူပါပြီ*\n\n` +
+        `💸 ${amount.toLocaleString()} ကျပ် သင့်အကောင့်မှ နုတ်ယူပြီးပါပြီ\n` +
+        `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ သို့မဟုတ် ငွေလောက်မပြည့်ပါ'}`).catch(() => {});
+    }
+  });
+
+  // /ban [userId] [reason]
+  bot.onText(/\/ban (\d+)(?:\s+(.+))?/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId = parseInt(match[1]);
+    const reason   = match[2]?.trim() || 'Admin စစ်ဆေး';
+
+    const res = await backendPost('/api/admin/bot/ban', { userId: targetId, reason });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *User ${targetId} ကို Ban ချပြီးပါပြီ*\n📝 Reason: ${reason}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      bot.sendMessage(targetId,
+        `🚫 *Account ပိတ်ထားပါသည်*\n\n` +
+        `Admin မှ သင့် Account ကို ပိတ်ဆို့ထားပါသည်\n` +
+        `📝 အကြောင်းပြချက်: ${reason}\n\n` +
+        `ပြဿနာရှိပါက Admin ထံ ဆက်သွယ်ပါ`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`).catch(() => {});
+    }
+  });
+
+  // /unban [userId]
+  bot.onText(/\/unban (\d+)/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId = parseInt(match[1]);
+
+    const res = await backendPost('/api/admin/bot/unban', { userId: targetId });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *User ${targetId} ကို Ban ဖြုတ်ပြီးပါပြီ*`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      bot.sendMessage(targetId,
+        `✅ *Account ပြန်ဖွင့်ပေးပြီးပါပြီ!*\n\n` +
+        `Admin မှ သင့် Account ကို ပြန်ဖွင့်ပေးပါပြီ\n` +
+        `App ကို ပုံမှန်အသုံးပြုနိုင်ပါပြီ 🎉`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`).catch(() => {});
+    }
+  });
+
+  // /userinfo [userId]
+  bot.onText(/\/userinfo (\d+)/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId = parseInt(match[1]);
+
+    const res = await backendGet(`/api/admin/bot/userinfo/${targetId}`);
+    if (res?.success && res.user) {
+      const u = res.user;
+      bot.sendMessage(msg.chat.id,
+        `👤 *User Info*\n\n` +
+        `🆔 ID: \`${u.userId}\`\n` +
+        `📛 Name: ${u.firstName || '-'}\n` +
+        `💰 Balance: ${u.balance?.toLocaleString()} ကျပ်\n` +
+        `👥 Invites: ${u.inviteCount} ယောက်\n` +
+        `🚫 Banned: ${u.banned ? 'Yes (' + u.banReason + ')' : 'No'}\n` +
+        `⛏️ Miners: ${u.activeMiners || 0} active\n` +
+        `📅 Joined: ${new Date(u.createdAt).toLocaleDateString('my-MM')}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ User ${targetId} မတွေ့ပါ`).catch(() => {});
+    }
+  });
+
+  // /stats
+  bot.onText(/\/stats/, async (msg) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const res = await backendGet('/api/admin/stats');
+    if (res) {
+      bot.sendMessage(msg.chat.id,
+        `📊 *App Statistics*\n\n` +
+        `👥 Total Users: ${res.totalUsers?.toLocaleString()}\n` +
+        `⛏️ Active Miners: ${res.activeMiners?.toLocaleString()}\n` +
+        `💸 Pending Withdrawals: ${res.pendingWithdrawals}\n` +
+        `⏳ Pending Miners: ${res.pendingMiners?.length || 0}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+  });
+
+  // /reply [userId] [message]
+  bot.onText(/\/reply (\d+) (.+)/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId = parseInt(match[1]);
+    const text     = match[2];
+    try {
+      await bot.sendMessage(targetId,
+        `📨 *Admin ထံမှ အကြောင်းပြန်စာ*\n\n${text}`,
+        { parse_mode: 'Markdown' }
+      );
+      bot.sendMessage(msg.chat.id, `✅ User ${targetId} ထံ စာပြန်ပြီးပါပြီ`).catch(() => {});
+    } catch {
+      bot.sendMessage(msg.chat.id, `❌ ပို့မရပါ — User က Bot ကို Block ထားနိုင်သည်`).catch(() => {});
+    }
+  });
+
+  // /broadcast [message]
+  bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const text = match[1];
+    bot.sendMessage(msg.chat.id, '📢 Broadcast စတင်မည်...').catch(() => {});
+
+    const data = await backendGet('/api/admin/users');
+    const users = data?.users || [];
+    let ok = 0, fail = 0;
+
+    for (let i = 0; i < users.length; i += 30) {
+      const batch = users.slice(i, i + 30);
+      await Promise.all(batch.map(async u => {
+        try {
+          await bot.sendMessage(u.userId, text, { parse_mode: 'HTML' });
+          ok++;
+        } catch { fail++; }
+      }));
+      if (i + 30 < users.length) await sleep(2000);
+    }
+    bot.sendMessage(msg.chat.id,
+      `✅ Broadcast ပြီးပါပြီ\n📤 Sent: ${ok}\n❌ Failed: ${fail}`
+    ).catch(() => {});
+  });
+
+  // ── Non-command messages ────────────────────────────────────
+  bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    if (userId === ADMIN_ID) return;
+    if (msg.text?.startsWith('/')) return;
+
+    // Forward text support messages to admin
+    if (msg.text) {
+      bot.sendMessage(ADMIN_ID,
+        `📩 *Support Message*\n\n` +
+        `👤 *${msg.from.first_name || ''}* (${userId})\n` +
+        `💬 ${msg.text}\n\n` +
+        `_Reply: /reply ${userId} <message>_`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+      bot.sendMessage(chatId, '✅ Admin ထံ송 ပြီးပါပြီ').catch(() => {});
+    }
+  });
+
+  // ── Polling error recovery ─────────────────────────────────
+  bot.on('polling_error', async (err) => {
+    console.error('Polling error:', err.message);
+    if (err.message.includes('409') && restartAttempts < MAX_RESTART) {
+      restartAttempts++;
+      if (isPolling) { await bot.stopPolling().catch(() => {}); isPolling = false; }
+      await forceClearWebhook();
+      await sleep(5000);
+      await initializeBot();
+    }
+  });
 }
 
-// ==================== Command Handlers ====================
-function setupCommandHandlers() {
-    if (!bot) return;
-
-    // /start command
-    bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
-        const chatId = msg.chat.id;
-        const userId = msg.from.id;
-        const firstName = msg.from.first_name || 'User';
-        const startParam = match[1]?.trim(); // referral code or "join"
-
-        console.log(`📩 /start from user ${userId}, param: ${startParam || 'none'}`);
-
-        try {
-            // Check channel membership
-            const isMember = await isChannelMember(userId);
-
-            if (!isMember) {
-                // Not a member — prompt to join
-                await bot.sendMessage(chatId,
-                    `မင်္ဂလာပါ ${firstName} ခင်ဗျာ! 🙏\n\n` +
-                    `Kyaw Ngar Mining Bot ကို အသုံးပြုရန် အရင်ဆုံး\n` +
-                    `ကျွန်ုပ်တို့၏ Channel ကို Join ဖြစ်ရပါမည်။\n\n` +
-                    `✅ Channel Join ပြီးနောက် /start ကို ထပ်နှိပ်ပါ။`,
-                    {
-                        reply_markup: {
-                            inline_keyboard: [
-                                [{ text: '📢 Channel Join ရန်', url: CHANNEL_LINK }]
-                            ]
-                        }
-                    }
-                );
-                return;
-            }
-
-            // Member — show welcome + handle referral
-            // If referral param exists, register user with referral via backend
-            if (startParam && startParam !== 'join') {
-                // Trigger backend registration with referral code
-                try {
-                    await axios.post(`${API_BASE_URL}/api/users/register`, {
-                        userId,
-                        firstName,
-                        username: msg.from.username || '',
-                        referralCode: startParam
-                    }, {
-                        headers: { 'X-Telegram-Init-Data': `user=${userId}` },
-                        timeout: 8000
-                    });
-                    console.log(`✅ Referral registration sent for user ${userId} with code ${startParam}`);
-                } catch (err) {
-                    // Registration might already exist — not critical
-                    console.log(`ℹ️ Registration note for user ${userId}:`, err.response?.data?.error || err.message);
-                }
-            }
-
-            await sendWelcomeMessage(chatId, firstName, startParam);
-
-        } catch (err) {
-            console.error('❌ /start error:', err.message);
-            try {
-                await bot.sendMessage(chatId, '❌ တစ်ခုခု မှားသွားပါသည်။ နောက်မှ ထပ်ကြိုးစားပါ။');
-            } catch (_) {}
-        }
-    });
-
-    // /join command — re-check membership
-    bot.onText(/\/join/, async (msg) => {
-        const chatId = msg.chat.id;
-        const userId = msg.from.id;
-        const firstName = msg.from.first_name || 'User';
-
-        try {
-            const isMember = await isChannelMember(userId);
-            if (!isMember) {
-                await bot.sendMessage(chatId,
-                    `❌ Channel ကို မ Join ရသေးပါ။\n\nChannel Join ပြီးမှ /start နှိပ်ပါ။`,
-                    {
-                        reply_markup: {
-                            inline_keyboard: [
-                                [{ text: '📢 Channel Join ရန်', url: CHANNEL_LINK }]
-                            ]
-                        }
-                    }
-                );
-            } else {
-                await sendWelcomeMessage(chatId, firstName, null);
-            }
-        } catch (err) {
-            console.error('❌ /join error:', err.message);
-        }
-    });
-
-    // /admin command
-    bot.onText(/\/admin/, (msg) => {
-        const chatId = msg.chat.id;
-        if (msg.from.id !== ADMIN_ID) {
-            return bot.sendMessage(chatId, '⛔ Admin မဟုတ်ပါ။').catch(() => {});
-        }
-        bot.sendMessage(chatId, '👑 Admin Panel', {
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '👑 Open Admin Panel', web_app: { url: `${WEB_APP_URL}/admin.html` } }]
-                ]
-            }
-        }).catch(err => console.error('❌ Admin error:', err));
-    });
-
-    // Forward non-command user messages to admin
-    bot.on('message', async (msg) => {
-        if (!msg.text || msg.text.startsWith('/')) return;
-        if (msg.from.id === ADMIN_ID) return;
-
-        // Check if it's a screenshot/photo — forward to admin
-        if (msg.photo || msg.document) {
-            try {
-                const caption = `📸 *Screenshot from user*\n👤 ${msg.from.first_name || ''}\n🆔 \`${msg.from.id}\``;
-                if (msg.photo) {
-                    const fileId = msg.photo[msg.photo.length - 1].file_id;
-                    await bot.sendPhoto(ADMIN_ID, fileId, { caption, parse_mode: 'Markdown' });
-                } else if (msg.document) {
-                    await bot.sendDocument(ADMIN_ID, msg.document.file_id, { caption, parse_mode: 'Markdown' });
-                }
-                await bot.sendMessage(msg.chat.id, '✅ Screenshot ကို Admin ထံ ပို့ပြီးပါပြီ။ မကြာမီ confirm ပေးပါမည်။');
-            } catch (err) {
-                console.error('❌ Photo forward error:', err.message);
-            }
-            return;
-        }
-
-        // Text message forward
-        try {
-            const forwardMsg =
-                `📩 *Support Message*\n\n` +
-                `👤 *User:* ${msg.from.first_name || ''} ${msg.from.last_name || ''}\n` +
-                `🆔 *User ID:* \`${msg.from.id}\`\n` +
-                `📝 *Message:*\n${msg.text}\n\n` +
-                `_Reply: /reply ${msg.from.id} <message>_`;
-            await bot.sendMessage(ADMIN_ID, forwardMsg, { parse_mode: 'Markdown' });
-            await bot.sendMessage(msg.chat.id, '✅ သင့်စာကို Admin ထံ ပို့ပြီးပါပြီ။');
-        } catch (err) {
-            console.error('❌ Message forward error:', err.message);
-        }
-    });
-
-    // /reply command for admin
-    bot.onText(/\/reply (\d+) (.+)/, async (msg, match) => {
-        const chatId = msg.chat.id;
-        if (msg.from.id !== ADMIN_ID) {
-            return bot.sendMessage(chatId, '⛔ Admin မဟုတ်ပါ။');
-        }
-        const targetUserId = parseInt(match[1]);
-        const replyText = match[2];
-        try {
-            await bot.sendMessage(targetUserId,
-                `📨 *Admin ထံမှ အကြောင်းပြန်စာ*\n\n${replyText}`,
-                { parse_mode: 'Markdown' }
-            );
-            await bot.sendMessage(chatId, `✅ User ${targetUserId} ထံ စာပြန်ပြီးပါပြီ။`);
-        } catch (err) {
-            console.error(`❌ Reply error to ${targetUserId}:`, err.message);
-            await bot.sendMessage(chatId, `❌ ပို့မရပါ။ User က Bot ကို block ထားနိုင်သည်။`);
-        }
-    });
-
-    // Polling error recovery
-    bot.on('polling_error', async (error) => {
-        console.error('❌ Polling error:', error.message);
-        if (error.message.includes('409') || error.message.includes('Conflict')) {
-            console.log('🔄 409 Conflict — restarting...');
-            restartAttempts++;
-            if (restartAttempts > MAX_RESTART_ATTEMPTS) {
-                console.error('❌ Too many restarts, exiting...');
-                process.exit(1);
-            }
-            try {
-                if (isPolling) { await bot.stopPolling(); isPolling = false; }
-                await forceClearWebhook();
-                await new Promise(r => setTimeout(r, 5000));
-                await initializeBot();
-            } catch (e) {
-                console.error('❌ Recovery failed:', e.message);
-            }
-        }
-    });
-}
-
-// ==================== Express Server ====================
+// ============================================================
+//  EXPRESS SERVER  —  Backend မှ ခေါ်သော Endpoints
+// ============================================================
 const app = express();
 app.use(express.json({ limit: '20mb' }));
 
-app.get('/', (req, res) => res.send('🤖 Kyaw Ngar Mining Bot is Running!'));
-app.get('/health', (req, res) => res.send('OK'));
-app.get('/status', (req, res) => res.json({
-    status: 'ok',
-    polling: isPolling,
-    timestamp: new Date().toISOString()
-}));
+app.get('/',       (_req, res) => res.send('🤖 Kyaw Ngar Mining Bot Running!'));
+app.get('/health', (_req, res) => res.send('OK'));
+app.get('/status', (_req, res) => res.json({ status: 'ok', polling: isPolling, ts: Date.now() }));
 
-// ==================== Referral Notification (called by backend) ====================
-app.post('/referral-notify', async (req, res) => {
-    const { referrerId, newUserId, newUserName, reward } = req.body;
-    if (!referrerId || !newUserId) {
-        return res.status(400).json({ error: 'Missing referrerId or newUserId' });
-    }
-    if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
+// ── Backend calls bot to notify admin with inline buttons ──
+// POST /send-miner-photo  { userId, firstName, minerId, slotIndex, screenshotBuffer(base64) }
+app.post('/send-miner-photo', async (req, res) => {
+  if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
+  const { userId, firstName, minerId, slotIndex, amount, screenshotBase64 } = req.body;
+  if (!userId || !minerId || !screenshotBase64) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
 
-    try {
-        const amount = reward || INVITE_REWARD;
-        const message =
-            `🎉 *လူသစ်တစ်ယောက် ဝင်ရောက်လာပါပြီ!*\n\n` +
-            `👤 *${newUserName || `User ${newUserId}`}* သည် သင့် referral link မှ ဝင်ရောက်လာပါသည်။\n` +
-            `💰 *${amount.toLocaleString()} ကျပ်* သင့်အကောင့်သို့ ထည့်သွင်းပြီးပါပြီ!\n\n` +
-            `Kyaw Ngar Mining`;
+  const slotPrices = { 1: 3000, 2: 5000, 3: 10000 };
+  const price = amount || slotPrices[slotIndex] || 0;
 
-        await bot.sendMessage(parseInt(referrerId), message, { parse_mode: 'Markdown' });
-        console.log(`✅ Referral notify sent to ${referrerId}`);
-        res.json({ success: true });
-    } catch (err) {
-        console.error('❌ Referral notify error:', err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
+  const caption =
+    `⛏️ *Miner Purchase Request*\n\n` +
+    `👤 *User:* ${firstName || userId}\n` +
+    `🆔 *User ID:* \`${userId}\`\n` +
+    `🔢 *Slot:* #${slotIndex}\n` +
+    `💰 *Amount:* ${price.toLocaleString()} ကျပ်\n` +
+    `🛒 *Miner ID:* \`${minerId}\`\n\n` +
+    `_Approve or Reject below ↓_`;
+
+  const inlineKeyboard = {
+    inline_keyboard: [[
+      { text: '✅ Approve',  callback_data: `miner_approve_${minerId}_${userId}_${slotIndex}` },
+      { text: '❌ Reject',   callback_data: `miner_reject_${minerId}_${userId}_${slotIndex}` }
+    ]]
+  };
+
+  try {
+    const buf = Buffer.from(screenshotBase64, 'base64');
+    await bot.sendPhoto(ADMIN_ID, buf, {
+      caption,
+      parse_mode: 'Markdown',
+      reply_markup: inlineKeyboard
+    });
+
+    // Tell user to wait
+    await bot.sendMessage(parseInt(userId),
+      `⏳ *Miner ဝယ်ယူမှု လက်ခံပြီးပါပြီ!*\n\n` +
+      `Screenshot ကို Admin ထံ တိုက်ရိုက်ပို့ပြီးပါပြီ\n` +
+      `မကြာမီ Admin စစ်ဆေးပြီး Activate ပေးပါမည် 🙏`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('send-miner-photo error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ==================== Miner Purchase Notify (Screenshot → Admin) ====================
-app.post('/miner-purchase-notify', async (req, res) => {
-    const { userId, userName, minerId, slotIndex, screenshotData } = req.body;
-    if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
+// ── Generic user notification (withdrawal etc.) ─────────────
+app.post('/notify-user', async (req, res) => {
+  if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
+  const { userId, message } = req.body;
+  if (!userId || !message) return res.status(400).json({ error: 'Missing fields' });
 
-    try {
-        const caption =
-            `⛏️ *Miner Purchase Request*\n\n` +
-            `👤 *User:* ${userName || userId}\n` +
-            `🆔 *User ID:* \`${userId}\`\n` +
-            `🔢 *Slot:* #${slotIndex}\n` +
-            `🛒 *Miner ID:* \`${minerId}\`\n\n` +
-            `Kpay: 09783646736 (Yee Mon Naing)\n` +
-            `Wave: 09790611406 (Aye Thandar)\n\n` +
-            `Confirm: /approve_miner_${minerId}\n` +
-            `Reject: /reject_miner_${minerId}`;
-
-        if (screenshotData) {
-            const base64Clean = screenshotData.replace(/^data:image\/\w+;base64,/, '');
-            const buffer = Buffer.from(base64Clean, 'base64');
-            await bot.sendPhoto(ADMIN_ID, buffer, { caption, parse_mode: 'Markdown' });
-        } else {
-            await bot.sendMessage(ADMIN_ID, caption, { parse_mode: 'Markdown' });
-        }
-
-        // Notify user to wait
-        await bot.sendMessage(parseInt(userId),
-            `⏳ *Miner ဝယ်ယူမှု လက်ခံပါပြီ!*\n\n` +
-            `Screenshot ကို Admin ထံ ပို့ပြီးပါပြီ။\n` +
-            `မကြာမီ Admin စစ်ဆေးပြီး activate ပေးပါမည်။ 🙏`,
-            { parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        console.log(`✅ Miner purchase notify sent to admin for user ${userId}`);
-        res.json({ success: true });
-    } catch (err) {
-        console.error('❌ Miner purchase notify error:', err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
+  try {
+    await bot.sendMessage(parseInt(userId), message, { parse_mode: 'Markdown' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ==================== Miner Approved/Rejected Notify ====================
-app.post('/miner-status-notify', async (req, res) => {
-    const { userId, slotIndex, status } = req.body;
-    if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
-
-    try {
-        let message;
-        if (status === 'active') {
-            message =
-                `✅ *Miner #${slotIndex} Activate ပြုလုပ်ပြီးပါပြီ!*\n\n` +
-                `Admin မှ သင့် Miner ကို confirm ပေးပါပြီ။\n` +
-                `ယခု ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် အလိုအလျောက် ရရှိနေပါမည်။ ⛏️💰`;
-        } else {
-            message =
-                `❌ *Miner #${slotIndex} ငြင်းဆန်ခံရပါသည်။*\n\n` +
-                `Admin မှ confirm မပေးပါ။\n` +
-                `Screenshot မှန်ကန်မှု စစ်ဆေးပြီး ထပ်မံ တင်ပေးပါ။`;
-        }
-
-        await bot.sendMessage(parseInt(userId), message, { parse_mode: 'Markdown' });
-        res.json({ success: true });
-    } catch (err) {
-        console.error('❌ Miner status notify error:', err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
+// ── Error handler ──────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  console.error('Express error:', err.message);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-// ==================== Withdrawal Notification ====================
-app.post('/withdrawal-notify', async (req, res) => {
-    const { userId, amount, method, status, reason, adminId } = req.body;
-    if (adminId !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-    if (!userId || !amount || !status) return res.status(400).json({ error: 'Missing fields' });
-    if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
-
-    try {
-        const now = new Date().toLocaleString('my-MM', {
-            year: 'numeric', month: 'long', day: 'numeric',
-            hour: '2-digit', minute: '2-digit'
-        });
-        let message;
-        if (status === 'completed') {
-            message =
-                `🎊 *ငွေထုတ်ယူမှု အောင်မြင်ပါသည်!* 🎊\n\n` +
-                `💰 *ပမာဏ:* \`${amount.toLocaleString()} ကျပ်\`\n` +
-                `🏦 *နည်းလမ်း:* ${method ? method.toUpperCase() : 'N/A'}\n` +
-                `🕒 *အချိန်:* ${now}\n\n` +
-                `သင်၏ Wallet/Bank App တွင် ပြန်လည်စစ်ဆေးပေးပါ။ 🙏`;
-        } else if (status === 'rejected') {
-            message =
-                `❌ *ငွေထုတ်ယူမှု ငြင်းပယ်ခံရပါသည်။*\n\n` +
-                `⚠️ *အကြောင်းပြချက်:* ${reason || 'မရှိပါ'}\n` +
-                `💰 *${amount.toLocaleString()} ကျပ်* ကို သင့်အကောင့်ထဲ ပြန်ထည့်ပေးပြီးပါပြီ။\n` +
-                `🕒 *အချိန်:* ${now}`;
-        } else {
-            return res.status(400).json({ error: 'Invalid status' });
-        }
-
-        await bot.sendMessage(parseInt(userId), message, { parse_mode: 'Markdown' });
-        res.json({ success: true });
-    } catch (err) {
-        console.error('❌ Withdrawal notify error:', err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// ==================== Broadcast ====================
-app.post('/broadcast', async (req, res) => {
-    const { message, adminId } = req.body;
-    if (adminId !== ADMIN_ID) return res.status(403).json({ error: 'Unauthorized' });
-    if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
-
-    res.status(202).json({ status: 'started' });
-    (async () => {
-        let successCount = 0, failCount = 0;
-        try {
-            const usersRes = await axios.get(`${API_BASE_URL}/api/admin/users`, {
-                headers: { 'X-Admin-Key': process.env.ADMIN_KEY || '' },
-                timeout: 15000
-            });
-            const users = usersRes.data.users || [];
-            console.log(`📢 Broadcast to ${users.length} users...`);
-            for (let i = 0; i < users.length; i += 50) {
-                const batch = users.slice(i, i + 50);
-                await Promise.all(batch.map(async (user) => {
-                    try {
-                        await bot.sendMessage(user.userId, message, { parse_mode: 'HTML' });
-                        successCount++;
-                    } catch (e) {
-                        failCount++;
-                    }
-                }));
-                if (i + 50 < users.length) await new Promise(r => setTimeout(r, 3000));
-            }
-            console.log(`✅ Broadcast done. OK: ${successCount}, Fail: ${failCount}`);
-        } catch (err) {
-            console.error('Broadcast error:', err.message);
-        }
-    })();
-});
-
-// ==================== Error Handler ====================
-app.use((err, req, res, next) => {
-    console.error('❌ Express error:', err.message);
-    res.status(500).json({ error: 'Internal server error' });
-});
-
-// ==================== Start Server ====================
+// ── Start ──────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
 initializeBot().then(() => {
-    app.listen(PORT, () => {
-        console.log(`
-╔══════════════════════════════════════╗
-║  ⛏️  Kyaw Ngar Mining Bot Ready!     ║
-╠══════════════════════════════════════╣
-║ 📡 Port: ${PORT.toString().padEnd(29)} ║
-║ 👑 Admin ID: ${ADMIN_ID.toString().padEnd(26)} ║
-║ 📢 Channel: freeeemoneeeyi            ║
-║ 🔄 Polling: Active                    ║
-╚══════════════════════════════════════╝
-        `);
-    });
-}).catch(err => {
-    console.error('❌ Failed to start:', err);
-    process.exit(1);
-});
+  app.listen(PORT, () => {
+    console.log(`
+╔══════════════════════════════════════════╗
+║  ⛏️  Kyaw Ngar Mining Bot  —  Ready!     ║
+╠══════════════════════════════════════════╣
+║  Port: ${String(PORT).padEnd(34)}║
+║  Admin: ${String(ADMIN_ID).padEnd(33)}║
+║  Referral ✅  Screenshot ✅  Admin ✅    ║
+╚══════════════════════════════════════════╝`);
+  });
+}).catch(e => { console.error('Startup failed:', e); process.exit(1); });
 
-process.once('SIGINT', () => { if (bot && isPolling) bot.stopPolling(); process.exit(0); });
-process.once('SIGTERM', () => { if (bot && isPolling) bot.stopPolling(); process.exit(0); });
+process.once('SIGINT',  () => { if (bot) bot.stopPolling(); process.exit(0); });
+process.once('SIGTERM', () => { if (bot) bot.stopPolling(); process.exit(0); });
