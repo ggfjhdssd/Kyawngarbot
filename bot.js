@@ -281,6 +281,52 @@ function setupHandlers() {
       return;
     }
 
+    // ── "wd_approve_{wdId}_{userId}" ────────────────────────
+    if (data.startsWith('wd_approve_')) {
+      if (userId !== ADMIN_ID) return;
+      const parts  = data.replace('wd_approve_', '').split('_');
+      const wdId   = parts[0];
+      const wUserId = parseInt(parts[1]);
+
+      const res = await backendPost('/api/admin/bot/approve-wd', { withdrawalId: wdId });
+      if (res?.success) {
+        bot.editMessageCaption(
+          (cb.message?.caption || '') + '\n\n✅ *APPROVED*',
+          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+        ).catch(() => {});
+        bot.sendMessage(wUserId,
+          `✅ *ငွေထုတ်မှု ခွင့်ပြုပြီးပါပြီ!*\n\n` +
+          `💰 ${(res.amount||0).toLocaleString()} ကျပ် မကြာမီ ငွေလွှဲပေးပါမည် 🙏`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      } else {
+        bot.answerCallbackQuery(cb.id, { text: '❌ ' + (res?.error || 'Error'), show_alert: true }).catch(() => {});
+      }
+      return;
+    }
+
+    // ── "wd_reject_{wdId}_{userId}" ─────────────────────────
+    if (data.startsWith('wd_reject_')) {
+      if (userId !== ADMIN_ID) return;
+      const parts  = data.replace('wd_reject_', '').split('_');
+      const wdId   = parts[0];
+      const wUserId = parseInt(parts[1]);
+
+      const res = await backendPost('/api/admin/bot/reject-wd', { withdrawalId: wdId });
+      if (res?.success) {
+        bot.editMessageCaption(
+          (cb.message?.caption || '') + '\n\n❌ *REJECTED (Refunded)*',
+          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+        ).catch(() => {});
+        bot.sendMessage(wUserId,
+          `❌ *ငွေထုတ်မှု ငြင်းဆန်ခံရပါသည်*\n\n` +
+          `💰 ငွေ ပြန်ထည့်ပေးပြီးပါပြီ\nAdmin ထံ ဆက်သွယ်ပါ`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
+      return;
+    }
+
     // ── "miner_reject_{minerId}_{userId}_{slot}" ─────────────
     if (data.startsWith('miner_reject_')) {
       if (userId !== ADMIN_ID) return;
@@ -313,14 +359,21 @@ function setupHandlers() {
     if (msg.from.id !== ADMIN_ID) return;
     bot.sendMessage(msg.chat.id,
       `🛠 *Admin Commands*\n\n` +
-      `/addmoney [UserID] [Amount] — ငွေထည့်ရန်\n` +
-      `/reducemoney [UserID] [Amount] — ငွေနုတ်ရန်\n` +
-      `/ban [UserID] [Reason] — User ပိတ်ရန်\n` +
-      `/unban [UserID] — User ပြန်ဖွင့်ရန်\n` +
-      `/userinfo [UserID] — User အချက်အလက်\n` +
-      `/broadcast [message] — Users အားလုံးသို့ Noti\n` +
-      `/reply [UserID] [message] — User ထံ စာပြန်ရန်\n` +
-      `/stats — App statistics`,
+      `💰 *ငွေ*\n` +
+      `/addmoney [ID] [Amount] — ငွေထည့်ရန်\n` +
+      `/reducemoney [ID] [Amount] — ငွေနုတ်ရန်\n\n` +
+      `⛏️ *Miner*\n` +
+      `/miner [ID] [miner1/2/3] — Miner ပေးရန်\n` +
+      `/giveminer [ID] [1/2/3] — Miner ပေးရန်\n` +
+      `/revokeminer [ID] [1/2/3] — Miner ဖြုတ်ရန်\n\n` +
+      `👤 *User*\n` +
+      `/ban [ID] [Reason] — User ပိတ်ရန်\n` +
+      `/unban [ID] — User ပြန်ဖွင့်ရန်\n` +
+      `/userinfo [ID] — User အချက်အလက်\n\n` +
+      `📢 *အခြား*\n` +
+      `/broadcast [message] — Noti ပို့ရန်\n` +
+      `/reply [ID] [message] — User ထံ စာပြန်ရန်\n` +
+      `/stats — Users/Balance Statistics`,
       { parse_mode: 'Markdown' }
     ).catch(() => {});
   });
@@ -459,10 +512,11 @@ function setupHandlers() {
     if (res) {
       bot.sendMessage(msg.chat.id,
         `📊 *App Statistics*\n\n` +
-        `👥 Total Users: ${res.totalUsers?.toLocaleString()}\n` +
-        `⛏️ Active Miners: ${res.activeMiners?.toLocaleString()}\n` +
-        `💸 Pending Withdrawals: ${res.pendingWithdrawals}\n` +
-        `⏳ Pending Miners: ${res.pendingMiners?.length || 0}`,
+        `👥 *Total Users:* ${res.totalUsers?.toLocaleString()} ယောက်\n` +
+        `💰 *Total Balance (All Users):* ${(res.totalBalance||0).toLocaleString()} ကျပ်\n` +
+        `⛏️ *Active Miners:* ${res.activeMiners?.toLocaleString()}\n` +
+        `💸 *Pending Withdrawals:* ${res.pendingWithdrawals}\n` +
+        `⏳ *Pending Miners:* ${res.pendingMiners?.length || 0}`,
         { parse_mode: 'Markdown' }
       ).catch(() => {});
     }
@@ -507,6 +561,32 @@ function setupHandlers() {
     bot.sendMessage(msg.chat.id,
       `✅ Broadcast ပြီးပါပြီ\n📤 Sent: ${ok}\n❌ Failed: ${fail}`
     ).catch(() => {});
+  });
+
+  // /miner [userId] [miner1/miner2/miner3] — shorthand alias for giveminer
+  bot.onText(/\/miner (\d+) (miner[123])/i, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const targetId  = parseInt(match[1]);
+    const slotIndex = parseInt(match[2].replace(/miner/i, ''));
+
+    const res = await backendPost('/api/admin/bot/giveminer', { userId: targetId, slotIndex });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *Miner ${match[2].toUpperCase()} ပေးပြီးပါပြီ*\n` +
+        `👤 User ID: ${targetId}\n` +
+        `⛏️ Slot #${slotIndex} ယခု Active ဖြစ်ပြီ!`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      bot.sendMessage(targetId,
+        `🎁 *Admin မှ Miner ပေးပါပြီ!*\n\n` +
+        `⛏️ *Slot #${slotIndex}* သင့်အတွက် Activate ပြုလုပ်ပြီးပါပြီ\n` +
+        `ယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရရှိနေပါမည်! 💰`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'Error ဖြစ်သွားသည်'}`).catch(() => {});
+    }
   });
 
   // /giveminer [userId] [slot] — Grant miner to user
@@ -643,6 +723,44 @@ app.post('/send-miner-photo', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error('send-miner-photo error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Backend calls bot to forward withdrawal fee screenshot to admin ──
+app.post('/send-withdrawal-photo', async (req, res) => {
+  if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
+  const { userId, firstName, withdrawalId, amount, method, accountNumber, accountName, screenshotBase64 } = req.body;
+  if (!userId || !withdrawalId || !screenshotBase64) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+
+  const caption =
+    `💸 *ငွေထုတ်တောင်းဆိုမှု — Fee Screenshot*\n\n` +
+    `👤 *User:* ${firstName || userId}\n` +
+    `🆔 *User ID:* \`${userId}\`\n` +
+    `💰 *Amount:* ${Number(amount).toLocaleString()} ကျပ်\n` +
+    `🏦 *Method:* ${method}\n` +
+    `📱 *Account:* ${accountNumber}\n` +
+    `👤 *Name:* ${accountName}\n` +
+    `🛒 *WD ID:* \`${withdrawalId}\`\n\n` +
+    `_Approve or Reject below ↓_`;
+
+  const inlineKeyboard = {
+    inline_keyboard: [[
+      { text: '✅ Approve', callback_data: `wd_approve_${withdrawalId}_${userId}` },
+      { text: '❌ Reject',  callback_data: `wd_reject_${withdrawalId}_${userId}` }
+    ]]
+  };
+
+  try {
+    const buf = Buffer.from(screenshotBase64, 'base64');
+    await bot.sendPhoto(ADMIN_ID, buf, {
+      caption, parse_mode: 'Markdown', reply_markup: inlineKeyboard
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('send-withdrawal-photo error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
