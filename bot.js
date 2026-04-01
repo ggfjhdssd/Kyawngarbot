@@ -352,9 +352,127 @@ function setupHandlers() {
     }
   });
 
-  // ── Admin commands ─────────────────────────────────────────
+  // ── /approve_miner_[ID] — Text command (Polling bug fix) ──
+  bot.onText(/^\/approve_miner_([a-zA-Z0-9]+)$/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const minerId = match[1];
+    const chatId  = msg.chat.id;
 
-  // /admin — help list
+    const res = await backendPost('/api/admin/bot/miners/approve', { minerId });
+    if (res?.success) {
+      bot.sendMessage(chatId,
+        `✅ *Miner Slot #${res.slotIndex} ခွင့်ပြုပြီးပါပြီ*\n👤 User ID: ${res.userId}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+      bot.sendMessage(res.userId,
+        `✅ *Miner #${res.slotIndex} Activate ပြုလုပ်ပြီးပါပြီ!*\n\nAdmin မှ confirm ပေးပါပြီ\nယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် ⛏️💰`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(chatId, `❌ ${res?.error || 'Miner မတွေ့ပါ သို့မဟုတ် Error ဖြစ်သွားသည်'}`).catch(() => {});
+    }
+  });
+
+  // ── /reject_miner_[ID] — Text command (Polling bug fix) ────
+  bot.onText(/^\/reject_miner_([a-zA-Z0-9]+)$/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const minerId = match[1];
+    const chatId  = msg.chat.id;
+
+    const res = await backendPost('/api/admin/bot/miners/reject', { minerId });
+    if (res?.success) {
+      bot.sendMessage(chatId,
+        `❌ *Miner Slot #${res.slotIndex} ငြင်းဆန်ပြီးပါပြီ*\n👤 User ID: ${res.userId}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+      bot.sendMessage(res.userId,
+        `❌ *Miner #${res.slotIndex} ငြင်းဆန်ခံရပါသည်*\n\nScreenshot မှန်ကန်မှု စစ်ဆေးပြီး ထပ်မံ တင်ပေးပါ`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(chatId, `❌ ${res?.error || 'Miner မတွေ့ပါ'}`).catch(() => {});
+    }
+  });
+
+  // ── /vpn — Enable VPN requirement ─────────────────────────
+  bot.onText(/^\/vpn$/, async (msg) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const res = await backendPost('/api/admin/bot/setvpn', { enabled: true });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `🔒 *VPN Control: ဖွင့်ပြီးပါပြီ*\n\nယခုမှစ၍ မြန်မာနိုင်ငံမှ User များသည်\nTask ကြည့်ရန် VPN ဖွင့်ထားရမည်ဖြစ်သည်\n\n📴 ပိတ်ရန် /unvpn`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+    }
+  });
+
+  // ── /unvpn — Disable VPN requirement ──────────────────────
+  bot.onText(/^\/unvpn$/, async (msg) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const res = await backendPost('/api/admin/bot/setvpn', { enabled: false });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `🔓 *VPN Control: ပိတ်ပြီးပါပြီ*\n\nယခုမှစ၍ VPN မပါဘဲ Task ကြည့်၍ ရပါပြီ\n\n🔒 ပြန်ဖွင့်ရန် /vpn`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+    }
+  });
+
+  // ── /setmin [amount] — Set minimum withdrawal ──────────────
+  bot.onText(/^\/setmin\s+(\d+)$/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const amount = parseInt(match[1]);
+    if (amount < 1000) {
+      bot.sendMessage(msg.chat.id, '❌ အနည်းဆုံး 1,000 ကျပ် ဖြစ်ရမည်').catch(() => {});
+      return;
+    }
+    const res = await backendPost('/api/admin/bot/setmin', { amount });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *Minimum Withdrawal ပြောင်းပြီးပါပြီ*\n\n💰 အနည်းဆုံး: *${amount.toLocaleString()} ကျပ်*`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+    }
+  });
+
+  // ── /setfee [amount] — Set withdrawal fee ─────────────────
+  bot.onText(/^\/setfee\s+(\d+)$/, async (msg, match) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const amount = parseInt(match[1]);
+    const res = await backendPost('/api/admin/bot/setfee', { amount });
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `✅ *Withdrawal Fee ပြောင်းပြီးပါပြီ*\n\n💸 ကြေး: *${amount.toLocaleString()} ကျပ်*`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+    }
+  });
+
+  // ── /settings — View current settings ─────────────────────
+  bot.onText(/^\/settings$/, async (msg) => {
+    if (msg.from.id !== ADMIN_ID) return;
+    const res = await backendGet('/api/admin/bot/getsettings');
+    if (res?.success) {
+      bot.sendMessage(msg.chat.id,
+        `⚙️ *Current Settings*\n\n` +
+        `🔒 VPN Required: ${res.vpnRequired ? '✅ On' : '❌ Off'}\n` +
+        `💰 Min Withdrawal: ${(res.minWithdrawal||50000).toLocaleString()} ကျပ်\n` +
+        `💸 Withdrawal Fee: ${(res.withdrawalFee||5000).toLocaleString()} ကျပ်\n\n` +
+        `📋 *Commands:*\n` +
+        `/vpn — VPN ဖွင့်\n/unvpn — VPN ပိတ်\n` +
+        `/setmin [ပမာဏ] — Min ပြောင်း\n/setfee [ကြေး] — Fee ပြောင်း`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+  });
   bot.onText(/\/admin$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     bot.sendMessage(msg.chat.id,
@@ -365,7 +483,15 @@ function setupHandlers() {
       `⛏️ *Miner*\n` +
       `/miner [ID] [miner1/2/3] — Miner ပေးရန်\n` +
       `/giveminer [ID] [1/2/3] — Miner ပေးရန်\n` +
-      `/revokeminer [ID] [1/2/3] — Miner ဖြုတ်ရန်\n\n` +
+      `/revokeminer [ID] [1/2/3] — Miner ဖြုတ်ရန်\n` +
+      `/approve_miner_[ID] — Text မှ Miner Approve\n` +
+      `/reject_miner_[ID] — Text မှ Miner Reject\n\n` +
+      `⚙️ *Settings*\n` +
+      `/vpn — VPN ဖွင့် (MM IP ဆို Modal ပြ)\n` +
+      `/unvpn — VPN ပိတ်\n` +
+      `/setmin [ပမာဏ] — Min Withdrawal ပြောင်း\n` +
+      `/setfee [ကြေး] — Withdrawal Fee ပြောင်း\n` +
+      `/settings — လက်ရှိ Settings ကြည့်\n\n` +
       `👤 *User*\n` +
       `/ban [ID] [Reason] — User ပိတ်ရန်\n` +
       `/unban [ID] — User ပြန်ဖွင့်ရန်\n` +
