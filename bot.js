@@ -5,6 +5,7 @@
  *  ✅ Miner purchase: Frontend မှ multer screenshot → Admin sendPhoto
  *                     Approve/Reject inline button ဖြင့် User Noti
  *  ✅ Admin commands: /addmoney /reducemoney /ban /unban
+ *  ✅ BUG FIX: Block/Unblock လုပ်ရင် Polling မရပ်တော့ပါ
  * ============================================================
  */
 
@@ -27,12 +28,28 @@ if (!BOT_TOKEN || !ADMIN_ID) {
 }
 
 // ── State ─────────────────────────────────────────────────────
-let bot, isPolling = false, restartAttempts = 0;
-const MAX_RESTART = 5;
+let bot, isPolling = false, isRestarting = false;
+let restartAttempts = 0;
+const MAX_RESTART = 10;
 
 // ── Helpers ───────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ============================================================
+//  [FIX #1] GLOBAL PROCESS ERROR HANDLERS
+//  Unhandled Rejection / Uncaught Exception ဖြစ်ရင် Bot crash မဖြစ်အောင်
+// ============================================================
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️  Unhandled Rejection at:', promise, '| Reason:', reason);
+  // Process exit မလုပ်ဘဲ log ထုတ်ကာ ဆက်အလုပ်လုပ်
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('⚠️  Uncaught Exception:', err.message, err.stack);
+  // ဤ error က polling ကို မထိမချဘဲ server ဆက်ပြီး run နေမည်
+});
+
+// ── Webhook clear ──────────────────────────────────────────────
 async function forceClearWebhook() {
   try {
     const r = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`);
@@ -73,7 +90,6 @@ async function sendWelcome(chatId, firstName, refParam) {
 
 // ── Send channel-join prompt (with referral embedded in callback) ─
 async function sendJoinPrompt(chatId, firstName, refCode) {
-  // Embed refCode in callback_data so it survives the join step
   const cbData = refCode ? `joined_${chatId}_${refCode}` : `joined_${chatId}_`;
   await bot.sendMessage(chatId,
     `မင်္ဂလာပါ *${firstName}* ✋\n\n` +
@@ -102,7 +118,6 @@ async function awardReferral(inviteeId, inviteeName, refCode) {
     if (res.data?.success && res.data?.referrerId) {
       const referrerId = res.data.referrerId;
       const reward     = res.data.reward || INVITE_REWARD;
-      // Send notification to referrer
       await bot.sendMessage(referrerId,
         `🎉 *သင်၏ Referral Link မှ လူသစ်တစ်ယောက် ဝင်ရောက်လာပါပြီ!*\n\n` +
         `👤 *${inviteeName}* သည် သင့် link မှတစ်ဆင့် ဝင်ရောက်လာသောကြောင့်\n` +
@@ -145,17 +160,67 @@ async function backendGet(path) {
 }
 
 // ============================================================
+//  [FIX #2] RESTART BOT FUNCTION (သီးသန့် Function)
+//  Old bot listeners ဖျက်ပြီး မှ new bot စတင်
+// ============================================================
+async function restartBot(reason = '') {
+  // ထပ်ပြီး restart မလုပ်မိအောင်
+  if (isRestarting) {
+    console.log('⏳ Already restarting, skipping...');
+    return;
+  }
+  if (restartAttempts >= MAX_RESTART) {
+    console.error(`❌ Max restart attempts (${MAX_RESTART}) reached. Manual check needed.`);
+    return;
+  }
+
+  isRestarting = true;
+  restartAttempts++;
+  const delay = Math.min(3000 * restartAttempts, 30000); // exponential backoff, max 30s
+
+  console.log(`\n🔄 Bot Restart [${restartAttempts}/${MAX_RESTART}] — Reason: ${reason}`);
+  console.log(`⏳ Waiting ${delay / 1000}s before restart...`);
+
+  try {
+    // [FIX #3] Old bot ရဲ့ listeners အားလုံး ဖျက် (duplicate handler မဖြစ်အောင်)
+    if (bot) {
+      bot.removeAllListeners();
+      if (isPolling) {
+        await bot.stopPolling().catch(() => {});
+        isPolling = false;
+      }
+      bot = null;
+    }
+
+    await sleep(delay);
+    await forceClearWebhook();
+    await sleep(2000);
+    await initializeBot();
+
+  } catch (e) {
+    console.error('❌ Restart failed:', e.message);
+    isRestarting = false;
+    // ပျက်သွားရင် နောက်ထပ် retry
+    setTimeout(() => restartBot('restart_failed_retry'), 10000);
+  }
+}
+
+// ============================================================
 //  INITIALIZE BOT
 // ============================================================
 async function initializeBot() {
   console.log('🚀 Initializing bot...');
-  await forceClearWebhook();
-  await sleep(3000);
 
   bot = new TelegramBot(BOT_TOKEN, {
-    polling: { interval: 300, autoStart: true, params: { timeout: 10 } }
+    polling: {
+      interval: 300,
+      autoStart: true,
+      params: { timeout: 10 }
+    }
   });
-  isPolling = true;
+
+  isPolling    = true;
+  isRestarting = false;
   restartAttempts = 0;
 
   const me = await bot.getMe();
@@ -180,7 +245,6 @@ function setupHandlers() {
       const joined = await isChannelMember(userId);
 
       if (!joined) {
-        // Persist pending ref code to backend so it survives restarts
         await backendPost('/api/bot/save-pending-ref', {
           userId, firstName,
           username: msg.from.username || '',
@@ -190,7 +254,6 @@ function setupHandlers() {
         return;
       }
 
-      // Already a member — process referral immediately
       if (refCode) {
         await awardReferral(userId, firstName, refCode);
       }
@@ -213,13 +276,10 @@ function setupHandlers() {
 
     // ── "joined_{userId}_{refCode}" ─────────────────────────
     if (data.startsWith('joined_')) {
-      const parts   = data.split('_');
-      // Format: joined_{targetUserId}_{refCode}
-      // parts[0]=joined, parts[1]=targetUserId, rest=refCode
+      const parts    = data.split('_');
       const targetId = parseInt(parts[1]);
       const refCode  = parts.slice(2).join('_') || '';
 
-      // Only respond to the user whose button it is
       if (userId !== targetId) {
         return bot.answerCallbackQuery(cb.id, { text: '❌ သင့်ခလုတ် မဟုတ်ပါ', show_alert: true }).catch(() => {});
       }
@@ -232,10 +292,8 @@ function setupHandlers() {
         }).catch(() => {});
       }
 
-      // Delete the join-prompt message
       bot.deleteMessage(chatId, cb.message.message_id).catch(() => {});
 
-      // Retrieve saved pending ref from backend (fallback)
       let codeToUse = refCode;
       if (!codeToUse) {
         const saved = await backendGet(`/api/bot/pending-ref/${userId}`);
@@ -246,7 +304,6 @@ function setupHandlers() {
         await awardReferral(userId, firstName, codeToUse);
       }
 
-      // Clear pending ref
       await backendPost('/api/bot/clear-pending-ref', { userId }).catch(() => {});
       await sendWelcome(chatId, firstName, codeToUse);
       return;
@@ -262,13 +319,11 @@ function setupHandlers() {
 
       const res = await backendPost('/api/admin/bot/miners/approve', { minerId });
       if (res?.success) {
-        // Edit the admin message caption
         bot.editMessageCaption(
           cb.message?.caption?.replace(/\n\n_Approve.*$/s, '') + '\n\n✅ *APPROVED*',
           { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
         ).catch(() => {});
 
-        // Notify user
         bot.sendMessage(mUserId,
           `✅ *Miner #${slot} Activate ပြုလုပ်ပြီးပါပြီ!*\n\n` +
           `Admin မှ သင့် Miner ကို confirm ပေးပါပြီ။\n` +
@@ -284,8 +339,8 @@ function setupHandlers() {
     // ── "wd_approve_{wdId}_{userId}" ────────────────────────
     if (data.startsWith('wd_approve_')) {
       if (userId !== ADMIN_ID) return;
-      const parts  = data.replace('wd_approve_', '').split('_');
-      const wdId   = parts[0];
+      const parts   = data.replace('wd_approve_', '').split('_');
+      const wdId    = parts[0];
       const wUserId = parseInt(parts[1]);
 
       const res = await backendPost('/api/admin/bot/approve-wd', { withdrawalId: wdId });
@@ -308,8 +363,8 @@ function setupHandlers() {
     // ── "wd_reject_{wdId}_{userId}" ─────────────────────────
     if (data.startsWith('wd_reject_')) {
       if (userId !== ADMIN_ID) return;
-      const parts  = data.replace('wd_reject_', '').split('_');
-      const wdId   = parts[0];
+      const parts   = data.replace('wd_reject_', '').split('_');
+      const wdId    = parts[0];
       const wUserId = parseInt(parts[1]);
 
       const res = await backendPost('/api/admin/bot/reject-wd', { withdrawalId: wdId });
@@ -352,7 +407,7 @@ function setupHandlers() {
     }
   });
 
-  // ── /approve_miner_[ID] — Text command (Polling bug fix) ──
+  // ── /approve_miner_[ID] — Text command ────────────────────
   bot.onText(/^\/approve_miner_([a-zA-Z0-9]+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const minerId = match[1];
@@ -373,7 +428,7 @@ function setupHandlers() {
     }
   });
 
-  // ── /reject_miner_[ID] — Text command (Polling bug fix) ────
+  // ── /reject_miner_[ID] — Text command ─────────────────────
   bot.onText(/^\/reject_miner_([a-zA-Z0-9]+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const minerId = match[1];
@@ -422,7 +477,7 @@ function setupHandlers() {
     }
   });
 
-  // ── /setmin [amount] — Set minimum withdrawal ──────────────
+  // ── /setmin [amount] ───────────────────────────────────────
   bot.onText(/^\/setmin\s+(\d+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const amount = parseInt(match[1]);
@@ -441,7 +496,7 @@ function setupHandlers() {
     }
   });
 
-  // ── /setfee [amount] — Set withdrawal fee ─────────────────
+  // ── /setfee [amount] ───────────────────────────────────────
   bot.onText(/^\/setfee\s+(\d+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const amount = parseInt(match[1]);
@@ -456,7 +511,7 @@ function setupHandlers() {
     }
   });
 
-  // ── /settings — View current settings ─────────────────────
+  // ── /settings ──────────────────────────────────────────────
   bot.onText(/^\/settings$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     const res = await backendGet('/api/admin/bot/getsettings');
@@ -473,6 +528,7 @@ function setupHandlers() {
       ).catch(() => {});
     }
   });
+
   bot.onText(/\/admin$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     bot.sendMessage(msg.chat.id,
@@ -520,7 +576,6 @@ function setupHandlers() {
         { parse_mode: 'Markdown' }
       ).catch(() => {});
 
-      // Notify target user
       bot.sendMessage(targetId,
         `💰 *Admin မှ ငွေထည့်ပေးပါပြီ!*\n\n` +
         `✅ ${amount.toLocaleString()} ကျပ် သင့်အကောင့်သို့ ထည့်သွင်းပြီးပါပြီ\n` +
@@ -670,7 +725,7 @@ function setupHandlers() {
     const text = match[1];
     bot.sendMessage(msg.chat.id, '📢 Broadcast စတင်မည်...').catch(() => {});
 
-    const data = await backendGet('/api/admin/users');
+    const data  = await backendGet('/api/admin/users');
     const users = data?.users || [];
     let ok = 0, fail = 0;
 
@@ -689,7 +744,7 @@ function setupHandlers() {
     ).catch(() => {});
   });
 
-  // /miner [userId] [miner1/miner2/miner3] — shorthand alias for giveminer
+  // /miner [userId] [miner1/miner2/miner3]
   bot.onText(/\/miner (\d+) (miner[123])/i, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId  = parseInt(match[1]);
@@ -715,7 +770,7 @@ function setupHandlers() {
     }
   });
 
-  // /giveminer [userId] [slot] — Grant miner to user
+  // /giveminer [userId] [slot]
   bot.onText(/\/giveminer (\d+) ([123])/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId  = parseInt(match[1]);
@@ -730,7 +785,6 @@ function setupHandlers() {
         { parse_mode: 'Markdown' }
       ).catch(() => {});
 
-      // Notify user
       bot.sendMessage(targetId,
         `🎁 *Admin မှ Miner ပေးပါပြီ!*\n\n` +
         `⛏️ *Slot #${slotIndex}* သင့်အတွက် Activate ပြုလုပ်ပြီးပါပြီ\n` +
@@ -742,7 +796,7 @@ function setupHandlers() {
     }
   });
 
-  // /revokeminer [userId] [slot] — Remove miner from user
+  // /revokeminer [userId] [slot]
   bot.onText(/\/revokeminer (\d+) ([123])/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId  = parseInt(match[1]);
@@ -766,7 +820,6 @@ function setupHandlers() {
     if (userId === ADMIN_ID) return;
     if (msg.text?.startsWith('/')) return;
 
-    // Forward text support messages to admin
     if (msg.text) {
       bot.sendMessage(ADMIN_ID,
         `📩 *Support Message*\n\n` +
@@ -775,21 +828,80 @@ function setupHandlers() {
         `_Reply: /reply ${userId} <message>_`,
         { parse_mode: 'Markdown' }
       ).catch(() => {});
-      bot.sendMessage(chatId, '✅ Admin ထံ송 ပြီးပါပြီ').catch(() => {});
+      bot.sendMessage(chatId, '✅ Admin ထံ ပို့ပြီးပါပြီ').catch(() => {});
     }
   });
 
-  // ── Polling error recovery ─────────────────────────────────
-  bot.on('polling_error', async (err) => {
-    console.error('Polling error:', err.message);
-    if (err.message.includes('409') && restartAttempts < MAX_RESTART) {
-      restartAttempts++;
-      if (isPolling) { await bot.stopPolling().catch(() => {}); isPolling = false; }
-      await forceClearWebhook();
-      await sleep(5000);
-      await initializeBot();
+  // ============================================================
+  //  [FIX #4] POLLING ERROR HANDLER — ERROR အားလုံး HANDLE လုပ်
+  //  403 (user blocked)  → log ထုတ်ပြီး polling ဆက်
+  //  409 (conflict)      → webhook ရှင်းပြီး restart
+  //  Network/Other error → exponential backoff ဖြင့် restart
+  // ============================================================
+  bot.on('polling_error', (err) => {
+    const errMsg  = err.message || '';
+    const errCode = err.code   || '';
+
+    // 403 Forbidden — User က Bot ကို Block လုပ်ထားတာကြောင့် ဖြစ်သော Error
+    // Polling ကိုမထိဘဲ log ထုတ်ပြီး ဆက်သွားမည်
+    if (errMsg.includes('403') || errMsg.includes('Forbidden')) {
+      console.warn(`⚠️  [polling_error] 403 Forbidden — User blocked bot (polling continues): ${errMsg}`);
+      return;
     }
+
+    // 404 — Invalid token
+    if (errMsg.includes('404')) {
+      console.error('❌ [polling_error] 404 — BOT_TOKEN မမှန်ပါ! Manual check လုပ်ပါ။');
+      return;
+    }
+
+    // 409 Conflict — webhook ရှင်းပြီး restart
+    if (errMsg.includes('409') || errCode === 'ETELEGRAM') {
+      console.error(`⚠️  [polling_error] 409 Conflict — restarting: ${errMsg}`);
+      restartBot('409_conflict');
+      return;
+    }
+
+    // Network errors (ECONNRESET, ETIMEDOUT, ENOTFOUND, etc.)
+    // ဒီ Error များဖြစ်ရင် polling ရပ်သွားနိုင်လို့ restart လုပ်မည်
+    if (
+      errCode === 'ECONNRESET'  ||
+      errCode === 'ETIMEDOUT'   ||
+      errCode === 'ENOTFOUND'   ||
+      errCode === 'ECONNREFUSED'||
+      errMsg.includes('network')  ||
+      errMsg.includes('timeout')  ||
+      errMsg.includes('EFATAL')
+    ) {
+      console.error(`⚠️  [polling_error] Network error [${errCode}]: ${errMsg} — restarting...`);
+      restartBot(`network_error_${errCode}`);
+      return;
+    }
+
+    // Unknown errors — log ထုတ်ပြီး restart
+    console.error(`⚠️  [polling_error] Unknown error [${errCode}]: ${errMsg} — restarting...`);
+    restartBot(`unknown_error_${errCode}`);
   });
+
+  // ============================================================
+  //  [FIX #5] POLLING WATCHDOG — 5 မိနစ်တိုင်း getMe() စစ်ဆေး
+  //  Bot silent ရပ်သွားရင် auto restart လုပ်မည်
+  // ============================================================
+  const watchdogInterval = setInterval(async () => {
+    if (!bot || !isPolling || isRestarting) return;
+    try {
+      await bot.getMe();
+      // getMe() အောင်ရင် polling ကောင်းနေသည်
+    } catch (e) {
+      console.error('🔍 Watchdog: getMe() failed — bot may be down:', e.message);
+      clearInterval(watchdogInterval);
+      if (!isRestarting) {
+        restartBot('watchdog_getme_failed');
+      }
+    }
+  }, 5 * 60 * 1000); // 5 minutes
+
+  console.log('✅ All handlers registered. Watchdog active.');
 }
 
 // ============================================================
@@ -800,10 +912,15 @@ app.use(express.json({ limit: '20mb' }));
 
 app.get('/',       (_req, res) => res.send('🤖 Kyaw Ngar Mining Bot Running!'));
 app.get('/health', (_req, res) => res.send('OK'));
-app.get('/status', (_req, res) => res.json({ status: 'ok', polling: isPolling, ts: Date.now() }));
+app.get('/status', (_req, res) => res.json({
+  status: 'ok',
+  polling: isPolling,
+  restarting: isRestarting,
+  restartAttempts,
+  ts: Date.now()
+}));
 
 // ── Backend calls bot to notify admin with inline buttons ──
-// POST /send-miner-photo  { userId, firstName, minerId, slotIndex, screenshotBuffer(base64) }
 app.post('/send-miner-photo', async (req, res) => {
   if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
   const { userId, firstName, minerId, slotIndex, amount, screenshotBase64 } = req.body;
@@ -838,7 +955,6 @@ app.post('/send-miner-photo', async (req, res) => {
       reply_markup: inlineKeyboard
     });
 
-    // Tell user to wait
     await bot.sendMessage(parseInt(userId),
       `⏳ *Miner ဝယ်ယူမှု လက်ခံပြီးပါပြီ!*\n\n` +
       `Screenshot ကို Admin ထံ တိုက်ရိုက်ပို့ပြီးပါပြီ\n` +
@@ -891,7 +1007,7 @@ app.post('/send-withdrawal-photo', async (req, res) => {
   }
 });
 
-// ── Generic user notification (withdrawal etc.) ─────────────
+// ── Generic user notification ─────────────────────────────────
 app.post('/notify-user', async (req, res) => {
   if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
   const { userId, message } = req.body;
@@ -905,13 +1021,13 @@ app.post('/notify-user', async (req, res) => {
   }
 });
 
-// ── Error handler ──────────────────────────────────────────
+// ── Error handler ──────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error('Express error:', err.message);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ── Start ──────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
 initializeBot().then(() => {
@@ -922,7 +1038,7 @@ initializeBot().then(() => {
 ╠══════════════════════════════════════════╣
 ║  Port: ${String(PORT).padEnd(34)}║
 ║  Admin: ${String(ADMIN_ID).padEnd(33)}║
-║  Referral ✅  Screenshot ✅  Admin ✅    ║
+║  Block/Unblock Fix ✅  Watchdog ✅       ║
 ╚══════════════════════════════════════════╝`);
   });
 }).catch(e => { console.error('Startup failed:', e); process.exit(1); });
