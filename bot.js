@@ -1,11 +1,23 @@
 /**
  * ============================================================
- *  KYAW NGAR MINING BOT  —  bot.js  (ပြင်ဆင်ထားသောဗားရှင်း)
+ *  KYAW NGAR MINING BOT  —  bot.js  (အပြည့်အစုံ Fix v2)
  *  ✅ Referral: Channel join ပြီးတာနဲ့ ချက်ချင်း 2000 ကျပ် + Noti
- *  ✅ Miner purchase: Frontend မှ multer screenshot → Admin sendPhoto
+ *  ✅ Miner purchase: Frontend မှ screenshot → Admin sendPhoto
  *                     Approve/Reject inline button ဖြင့် User Noti
- *  ✅ Admin commands: /addmoney /reducemoney /ban /unban
- *  ✅ BUG FIX: Block/Unblock လုပ်ရင် Polling မရပ်တော့ပါ
+ *  ✅ Admin commands: /addmoney /reducemoney /ban /unban etc.
+ *
+ *  🔧 BUG FIX v2 (bitcoin-bot နဲ့ စစ်ဆေးပြီး ပြင်ဆင်ထားတာ):
+ *  ✅ FIX #1 — MAX_RESTART ရောက်ရင် bot ထာဝရ dead မဖြစ်တော့ပါ
+ *              (10 မိနစ်ကြာ နောက်ထပ် retry လုပ်သည်)
+ *  ✅ FIX #2 — Watchdog Interval Leak မဖြစ်တော့ပါ
+ *              (Module-level variable ဖြင့် old interval ကို clear လုပ်သည်)
+ *  ✅ FIX #3 — Polling Silent Death ကို စစ်ဆေးနိုင်ပြီ
+ *              (lastUpdateTime track လုပ်ပြီး 10+ မိနစ် update မရရင် restart)
+ *  ✅ FIX #4 — my_chat_member event (Block/Unblock) ကို handle လုပ်ပြီ
+ *              (User block/unblock ဖြစ်ရင် bot ကိုမထိမချဘဲ log ထုတ်ကာ ဆက်)
+ *  ✅ FIX #5 — isPolling state မမှန်ကန်မှု ပြင်ပြီ
+ *  ✅ FIX #6 — 403 Forbidden error (user blocked) ကို sendMessage တိုင်း
+ *              safely catch လုပ်ပြီ
  * ============================================================
  */
 
@@ -28,31 +40,58 @@ if (!BOT_TOKEN || !ADMIN_ID) {
 }
 
 // ── State ─────────────────────────────────────────────────────
-let bot, isPolling = false, isRestarting = false;
+let bot         = null;
+let isPolling   = false;
+let isRestarting = false;
 let restartAttempts = 0;
 const MAX_RESTART = 10;
+
+// [FIX #2] — Watchdog interval ကို module-level မှာ သိမ်းပြီး leak မဖြစ်အောင်
+let watchdogTimer = null;
+
+// [FIX #3] — Polling silent death စစ်ဆေးရန် last update time track
+let lastUpdateTime = Date.now();
 
 // ── Helpers ───────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ============================================================
-//  [FIX #1] GLOBAL PROCESS ERROR HANDLERS
-//  Unhandled Rejection / Uncaught Exception ဖြစ်ရင် Bot crash မဖြစ်အောင်
-// ============================================================
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('⚠️  Unhandled Rejection at:', promise, '| Reason:', reason);
-  // Process exit မလုပ်ဘဲ log ထုတ်ကာ ဆက်အလုပ်လုပ်
+// ── Safe sendMessage (403 block error ကို silently ignore) ────
+async function safeSend(chatId, text, opts = {}) {
+  if (!bot || !isPolling) return null;
+  try {
+    return await bot.sendMessage(chatId, text, opts);
+  } catch (e) {
+    // 403 Forbidden = user blocked bot → log ထုတ်ပြီး ဆက်
+    if (e.response?.statusCode === 403 || (e.message || '').includes('403') || (e.message || '').includes('Forbidden') || (e.message || '').includes('blocked')) {
+      console.warn(`⚠️  safeSend: User ${chatId} has blocked the bot. Skipping.`);
+      return null;
+    }
+    // 400 Bad Request (e.g. chat not found) → log ထုတ်ပြီး ဆက်
+    if (e.response?.statusCode === 400 || (e.message || '').includes('400')) {
+      console.warn(`⚠️  safeSend: Bad request for chatId ${chatId}: ${e.message}`);
+      return null;
+    }
+    console.error(`❌ safeSend error (chatId ${chatId}):`, e.message);
+    return null;
+  }
+}
+
+// ── Global Process Error Handlers ─────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️  Unhandled Rejection:', reason?.message || reason);
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('⚠️  Uncaught Exception:', err.message, err.stack);
-  // ဤ error က polling ကို မထိမချဘဲ server ဆက်ပြီး run နေမည်
+  console.error('⚠️  Uncaught Exception:', err.message);
 });
 
 // ── Webhook clear ──────────────────────────────────────────────
 async function forceClearWebhook() {
   try {
-    const r = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`);
+    const r = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`,
+      { timeout: 10000 }
+    );
     console.log('✅ Webhook cleared:', r.data.description);
   } catch (e) {
     console.error('❌ clearWebhook error:', e.message);
@@ -62,16 +101,19 @@ async function forceClearWebhook() {
 async function isChannelMember(userId) {
   try {
     const r = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-      params: { chat_id: CHANNEL_ID, user_id: userId }
+      params: { chat_id: CHANNEL_ID, user_id: userId },
+      timeout: 8000
     });
     return ['member', 'administrator', 'creator'].includes(r.data.result?.status);
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 // ── Welcome message ───────────────────────────────────────────
 async function sendWelcome(chatId, firstName, refParam) {
   const url = refParam ? `${WEB_APP_URL}?startapp=${refParam}` : WEB_APP_URL;
-  await bot.sendMessage(chatId,
+  await safeSend(chatId,
     `မင်္ဂလာပါ *${firstName}* ခင်ဗျာ! 🙏\n` +
     `Kyaw Ngar Mining မှ ကြိုဆိုပါတယ်။\n\n` +
     `⛏️ *Miner ဝယ်ယူ:* ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရှာပေးမည်\n` +
@@ -85,13 +127,13 @@ async function sendWelcome(chatId, firstName, refParam) {
         inline_keyboard: [[{ text: '🚀 Open App', web_app: { url } }]]
       }
     }
-  ).catch(() => {});
+  );
 }
 
-// ── Send channel-join prompt (with referral embedded in callback) ─
+// ── Channel join prompt ───────────────────────────────────────
 async function sendJoinPrompt(chatId, firstName, refCode) {
   const cbData = refCode ? `joined_${chatId}_${refCode}` : `joined_${chatId}_`;
-  await bot.sendMessage(chatId,
+  await safeSend(chatId,
     `မင်္ဂလာပါ *${firstName}* ✋\n\n` +
     `⚠️ App ကို အသုံးပြုရန် ကျွန်ုပ်တို့ Channel ကို အရင် *Join* ဖြစ်ရပါမည်!\n\n` +
     `📢 Join ပြီးမှ ✅ ခလုတ်နှိပ်ပါ`,
@@ -104,10 +146,10 @@ async function sendJoinPrompt(chatId, firstName, refCode) {
         ]
       }
     }
-  ).catch(() => {});
+  );
 }
 
-// ── Award referral (idempotent) ───────────────────────────────
+// ── Award referral ────────────────────────────────────────────
 async function awardReferral(inviteeId, inviteeName, refCode) {
   if (!refCode) return;
   try {
@@ -118,19 +160,19 @@ async function awardReferral(inviteeId, inviteeName, refCode) {
     if (res.data?.success && res.data?.referrerId) {
       const referrerId = res.data.referrerId;
       const reward     = res.data.reward || INVITE_REWARD;
-      await bot.sendMessage(referrerId,
+      await safeSend(referrerId,
         `🎉 *သင်၏ Referral Link မှ လူသစ်တစ်ယောက် ဝင်ရောက်လာပါပြီ!*\n\n` +
         `👤 *${inviteeName}* သည် သင့် link မှတစ်ဆင့် ဝင်ရောက်လာသောကြောင့်\n` +
         `💰 *${reward.toLocaleString()} ကျပ်* သင့်အကောင့်သို့ ချက်ချင်းထည့်သွင်းပြီးပါပြီ!`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     }
   } catch (e) {
     console.warn('awardReferral error:', e.message);
   }
 }
 
-// ── Backend API helper ─────────────────────────────────────────
+// ── Backend API helpers ───────────────────────────────────────
 const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY || 'kyawngar_internal_bot_key';
 
 async function backendPost(path, body) {
@@ -160,29 +202,77 @@ async function backendGet(path) {
 }
 
 // ============================================================
-//  [FIX #2] RESTART BOT FUNCTION (သီးသန့် Function)
-//  Old bot listeners ဖျက်ပြီး မှ new bot စတင်
+//  [FIX #2 + #1] WATCHDOG — Module-level, no leak
+//  Interval ကို module level မှာ သိမ်း၊ restart တိုင်း clear လုပ်ပြီး
+//  အသစ် create မှသာ ဖြစ်မည်
+// ============================================================
+function startWatchdog() {
+  // Old watchdog ရှိရင် ဖျက်ပြီးမှ အသစ် start
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+
+  watchdogTimer = setInterval(async () => {
+    if (!bot || !isPolling || isRestarting) return;
+
+    try {
+      // [FIX #5] — getMe() စစ်ဆေးခြင်း
+      await bot.getMe();
+
+      // [FIX #3] — Polling silent death စစ်ဆေးခြင်း
+      // 10 မိနစ် update မရရင် polling သေနေတာ ဖြစ်နိုင်
+      const minutesSinceUpdate = (Date.now() - lastUpdateTime) / 60000;
+      if (minutesSinceUpdate > 10) {
+        console.warn(`🔍 Watchdog: No updates for ${minutesSinceUpdate.toFixed(1)} min — possible polling death. Restarting...`);
+        restartBot('watchdog_no_updates');
+      }
+
+    } catch (e) {
+      console.error('🔍 Watchdog: getMe() failed — bot may be down:', e.message);
+      if (!isRestarting) {
+        restartBot('watchdog_getme_failed');
+      }
+    }
+  }, 5 * 60 * 1000); // 5 မိနစ်တိုင်း စစ်ဆေး
+
+  console.log('🔍 Watchdog started.');
+}
+
+// ============================================================
+//  [FIX #1] RESTART BOT — MAX_RESTART ရောက်ရင်
+//  ထာဝရ dead မဖြစ်ဘဲ 10 မိနစ်ကြာပြီး ထပ်ကြိုးစားမည်
 // ============================================================
 async function restartBot(reason = '') {
-  // ထပ်ပြီး restart မလုပ်မိအောင်
   if (isRestarting) {
     console.log('⏳ Already restarting, skipping...');
     return;
   }
+
+  // [FIX #1] MAX_RESTART ရောက်ရင် ထာဝရ ရပ်မနေဘဲ 10 မိနစ်ကြာပြီး retry
   if (restartAttempts >= MAX_RESTART) {
-    console.error(`❌ Max restart attempts (${MAX_RESTART}) reached. Manual check needed.`);
-    return;
+    console.error(`❌ Max restart attempts (${MAX_RESTART}) reached. Waiting 10 min before retry...`);
+    restartAttempts = 0; // reset counter ပြန်
+    await sleep(10 * 60 * 1000); // 10 မိနစ် စောင့်
+    console.log('🔄 Retrying after max-restart cooldown...');
+    // fall through — attempt restart below
   }
 
   isRestarting = true;
   restartAttempts++;
-  const delay = Math.min(3000 * restartAttempts, 30000); // exponential backoff, max 30s
+  const delay = Math.min(3000 * restartAttempts, 30000); // max 30s
 
   console.log(`\n🔄 Bot Restart [${restartAttempts}/${MAX_RESTART}] — Reason: ${reason}`);
   console.log(`⏳ Waiting ${delay / 1000}s before restart...`);
 
   try {
-    // [FIX #3] Old bot ရဲ့ listeners အားလုံး ဖျက် (duplicate handler မဖြစ်အောင်)
+    // [FIX #2] — Old watchdog ကို ဖျက်
+    if (watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = null;
+    }
+
+    // Old bot ရဲ့ listeners အားလုံး ဖျက်
     if (bot) {
       bot.removeAllListeners();
       if (isPolling) {
@@ -200,7 +290,6 @@ async function restartBot(reason = '') {
   } catch (e) {
     console.error('❌ Restart failed:', e.message);
     isRestarting = false;
-    // ပျက်သွားရင် နောက်ထပ် retry
     setTimeout(() => restartBot('restart_failed_retry'), 10000);
   }
 }
@@ -219,14 +308,16 @@ async function initializeBot() {
     }
   });
 
-  isPolling    = true;
-  isRestarting = false;
+  isPolling       = true;
+  isRestarting    = false;
   restartAttempts = 0;
+  lastUpdateTime  = Date.now(); // [FIX #3] reset update time
 
   const me = await bot.getMe();
   console.log(`🤖 Bot ready: @${me.username}`);
 
   setupHandlers();
+  startWatchdog(); // [FIX #2] — Watchdog ကို module-level function မှ start
 }
 
 // ============================================================
@@ -234,8 +325,31 @@ async function initializeBot() {
 // ============================================================
 function setupHandlers() {
 
+  // [FIX #3] — Update ရတိုင်း lastUpdateTime refresh
+  bot.on('message', (msg) => {
+    lastUpdateTime = Date.now();
+  });
+  bot.on('callback_query', () => {
+    lastUpdateTime = Date.now();
+  });
+
+  // ── [FIX #4] my_chat_member — User Block/Unblock event ──
+  // User က bot ကို block/unblock လုပ်ရင် Telegram မှ ဤ event ပို့
+  // Polling ကိုမထိဘဲ log ထုတ်ကာ ဆက်သွား
+  bot.on('my_chat_member', (update) => {
+    const newStatus = update.new_chat_member?.status;
+    const userId    = update.from?.id;
+    if (newStatus === 'kicked') {
+      console.warn(`⚠️  [my_chat_member] User ${userId} has BLOCKED the bot. Polling unaffected.`);
+    } else if (newStatus === 'member') {
+      console.log(`ℹ️  [my_chat_member] User ${userId} has UNBLOCKED the bot.`);
+    }
+    // ─── Polling မထိ — ဆက်သွားသည် ───
+  });
+
   // ── /start ────────────────────────────────────────────────
   bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+    lastUpdateTime = Date.now(); // [FIX #3]
     const chatId    = msg.chat.id;
     const userId    = msg.from.id;
     const firstName = msg.from.first_name || 'User';
@@ -249,7 +363,7 @@ function setupHandlers() {
           userId, firstName,
           username: msg.from.username || '',
           refCode: refCode || null
-        }).catch(() => {});
+        });
         await sendJoinPrompt(chatId, firstName, refCode);
         return;
       }
@@ -261,18 +375,21 @@ function setupHandlers() {
 
     } catch (e) {
       console.error('/start error:', e.message);
-      bot.sendMessage(chatId, '❌ တစ်ခုခု မှားသွားပါသည်။ ထပ်ကြိုးစားပါ။').catch(() => {});
+      // [FIX #6] — error reply ကို safeSend သုံး (block ဖြစ်နေရင် crash မဖြစ်ရန်)
+      await safeSend(chatId, '❌ တစ်ခုခု မှားသွားပါသည်။ ထပ်ကြိုးစားပါ။');
     }
   });
 
-  // ── Callback queries (Join check, Miner Approve/Reject) ───
+  // ── Callback queries ──────────────────────────────────────
   bot.on('callback_query', async (cb) => {
+    lastUpdateTime = Date.now(); // [FIX #3]
     const chatId    = cb.message?.chat?.id;
     const userId    = cb.from?.id;
     const firstName = cb.from?.first_name || 'User';
     const data      = cb.data || '';
 
-    await bot.answerCallbackQuery(cb.id).catch(() => {});
+    // answerCallbackQuery ကို safeguard ထည့်ပြီး call
+    try { await bot.answerCallbackQuery(cb.id); } catch {}
 
     // ── "joined_{userId}_{refCode}" ─────────────────────────
     if (data.startsWith('joined_')) {
@@ -281,18 +398,26 @@ function setupHandlers() {
       const refCode  = parts.slice(2).join('_') || '';
 
       if (userId !== targetId) {
-        return bot.answerCallbackQuery(cb.id, { text: '❌ သင့်ခလုတ် မဟုတ်ပါ', show_alert: true }).catch(() => {});
+        try {
+          await bot.answerCallbackQuery(cb.id, {
+            text: '❌ သင့်ခလုတ် မဟုတ်ပါ', show_alert: true
+          });
+        } catch {}
+        return;
       }
 
       const joined = await isChannelMember(userId);
       if (!joined) {
-        return bot.answerCallbackQuery(cb.id, {
-          text: '❌ Channel ကို Join မလုပ်ရသေးပါ! Join လုပ်ပြီးမှ ထပ်နှိပ်ပါ။',
-          show_alert: true
-        }).catch(() => {});
+        try {
+          await bot.answerCallbackQuery(cb.id, {
+            text: '❌ Channel ကို Join မလုပ်ရသေးပါ! Join လုပ်ပြီးမှ ထပ်နှိပ်ပါ။',
+            show_alert: true
+          });
+        } catch {}
+        return;
       }
 
-      bot.deleteMessage(chatId, cb.message.message_id).catch(() => {});
+      try { await bot.deleteMessage(chatId, cb.message.message_id); } catch {}
 
       let codeToUse = refCode;
       if (!codeToUse) {
@@ -304,7 +429,7 @@ function setupHandlers() {
         await awardReferral(userId, firstName, codeToUse);
       }
 
-      await backendPost('/api/bot/clear-pending-ref', { userId }).catch(() => {});
+      await backendPost('/api/bot/clear-pending-ref', { userId });
       await sendWelcome(chatId, firstName, codeToUse);
       return;
     }
@@ -319,65 +444,24 @@ function setupHandlers() {
 
       const res = await backendPost('/api/admin/bot/miners/approve', { minerId });
       if (res?.success) {
-        bot.editMessageCaption(
-          cb.message?.caption?.replace(/\n\n_Approve.*$/s, '') + '\n\n✅ *APPROVED*',
-          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        bot.sendMessage(mUserId,
+        try {
+          await bot.editMessageCaption(
+            (cb.message?.caption || '').replace(/\n\n_Approve.*$/s, '') + '\n\n✅ *APPROVED*',
+            { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+          );
+        } catch {}
+        await safeSend(mUserId,
           `✅ *Miner #${slot} Activate ပြုလုပ်ပြီးပါပြီ!*\n\n` +
           `Admin မှ သင့် Miner ကို confirm ပေးပါပြီ။\n` +
           `ယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရရှိနေပါမည်! ⛏️💰`,
           { parse_mode: 'Markdown' }
-        ).catch(() => {});
+        );
       } else {
-        bot.answerCallbackQuery(cb.id, { text: '❌ Error: ' + (res?.error || 'Server error'), show_alert: true }).catch(() => {});
-      }
-      return;
-    }
-
-    // ── "wd_approve_{wdId}_{userId}" ────────────────────────
-    if (data.startsWith('wd_approve_')) {
-      if (userId !== ADMIN_ID) return;
-      const parts   = data.replace('wd_approve_', '').split('_');
-      const wdId    = parts[0];
-      const wUserId = parseInt(parts[1]);
-
-      const res = await backendPost('/api/admin/bot/approve-wd', { withdrawalId: wdId });
-      if (res?.success) {
-        bot.editMessageCaption(
-          (cb.message?.caption || '') + '\n\n✅ *APPROVED*',
-          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
-        ).catch(() => {});
-        bot.sendMessage(wUserId,
-          `✅ *ငွေထုတ်မှု ခွင့်ပြုပြီးပါပြီ!*\n\n` +
-          `💰 ${(res.amount||0).toLocaleString()} ကျပ် မကြာမီ ငွေလွှဲပေးပါမည် 🙏`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-      } else {
-        bot.answerCallbackQuery(cb.id, { text: '❌ ' + (res?.error || 'Error'), show_alert: true }).catch(() => {});
-      }
-      return;
-    }
-
-    // ── "wd_reject_{wdId}_{userId}" ─────────────────────────
-    if (data.startsWith('wd_reject_')) {
-      if (userId !== ADMIN_ID) return;
-      const parts   = data.replace('wd_reject_', '').split('_');
-      const wdId    = parts[0];
-      const wUserId = parseInt(parts[1]);
-
-      const res = await backendPost('/api/admin/bot/reject-wd', { withdrawalId: wdId });
-      if (res?.success) {
-        bot.editMessageCaption(
-          (cb.message?.caption || '') + '\n\n❌ *REJECTED (Refunded)*',
-          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
-        ).catch(() => {});
-        bot.sendMessage(wUserId,
-          `❌ *ငွေထုတ်မှု ငြင်းဆန်ခံရပါသည်*\n\n` +
-          `💰 ငွေ ပြန်ထည့်ပေးပြီးပါပြီ\nAdmin ထံ ဆက်သွယ်ပါ`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
+        try {
+          await bot.answerCallbackQuery(cb.id, {
+            text: '❌ Error: ' + (res?.error || 'Server error'), show_alert: true
+          });
+        } catch {}
       }
       return;
     }
@@ -392,22 +476,77 @@ function setupHandlers() {
 
       const res = await backendPost('/api/admin/bot/miners/reject', { minerId });
       if (res?.success) {
-        bot.editMessageCaption(
-          cb.message?.caption?.replace(/\n\n_Approve.*$/s, '') + '\n\n❌ *REJECTED*',
-          { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        bot.sendMessage(mUserId,
+        try {
+          await bot.editMessageCaption(
+            (cb.message?.caption || '').replace(/\n\n_Approve.*$/s, '') + '\n\n❌ *REJECTED*',
+            { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+          );
+        } catch {}
+        await safeSend(mUserId,
           `❌ *Miner #${slot} ငြင်းဆန်ခံရပါသည်။*\n\n` +
           `Screenshot မှန်ကန်မှု စစ်ဆေးပြီး ထပ်မံ တင်ပေးပါ။`,
           { parse_mode: 'Markdown' }
-        ).catch(() => {});
+        );
+      }
+      return;
+    }
+
+    // ── "wd_approve_{wdId}_{userId}" ────────────────────────
+    if (data.startsWith('wd_approve_')) {
+      if (userId !== ADMIN_ID) return;
+      const parts   = data.replace('wd_approve_', '').split('_');
+      const wdId    = parts[0];
+      const wUserId = parseInt(parts[1]);
+
+      const res = await backendPost('/api/admin/bot/approve-wd', { withdrawalId: wdId });
+      if (res?.success) {
+        try {
+          await bot.editMessageCaption(
+            (cb.message?.caption || '') + '\n\n✅ *APPROVED*',
+            { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+          );
+        } catch {}
+        await safeSend(wUserId,
+          `✅ *ငွေထုတ်မှု ခွင့်ပြုပြီးပါပြီ!*\n\n` +
+          `💰 ${(res.amount || 0).toLocaleString()} ကျပ် မကြာမီ ငွေလွှဲပေးပါမည် 🙏`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        try {
+          await bot.answerCallbackQuery(cb.id, {
+            text: '❌ ' + (res?.error || 'Error'), show_alert: true
+          });
+        } catch {}
+      }
+      return;
+    }
+
+    // ── "wd_reject_{wdId}_{userId}" ─────────────────────────
+    if (data.startsWith('wd_reject_')) {
+      if (userId !== ADMIN_ID) return;
+      const parts   = data.replace('wd_reject_', '').split('_');
+      const wdId    = parts[0];
+      const wUserId = parseInt(parts[1]);
+
+      const res = await backendPost('/api/admin/bot/reject-wd', { withdrawalId: wdId });
+      if (res?.success) {
+        try {
+          await bot.editMessageCaption(
+            (cb.message?.caption || '') + '\n\n❌ *REJECTED (Refunded)*',
+            { chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'Markdown' }
+          );
+        } catch {}
+        await safeSend(wUserId,
+          `❌ *ငွေထုတ်မှု ငြင်းဆန်ခံရပါသည်*\n\n` +
+          `💰 ငွေ ပြန်ထည့်ပေးပြီးပါပြီ\nAdmin ထံ ဆက်သွယ်ပါ`,
+          { parse_mode: 'Markdown' }
+        );
       }
       return;
     }
   });
 
-  // ── /approve_miner_[ID] — Text command ────────────────────
+  // ── /approve_miner_[ID] ───────────────────────────────────
   bot.onText(/^\/approve_miner_([a-zA-Z0-9]+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const minerId = match[1];
@@ -415,20 +554,20 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/miners/approve', { minerId });
     if (res?.success) {
-      bot.sendMessage(chatId,
+      await safeSend(chatId,
         `✅ *Miner Slot #${res.slotIndex} ခွင့်ပြုပြီးပါပြီ*\n👤 User ID: ${res.userId}`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-      bot.sendMessage(res.userId,
+      );
+      await safeSend(res.userId,
         `✅ *Miner #${res.slotIndex} Activate ပြုလုပ်ပြီးပါပြီ!*\n\nAdmin မှ confirm ပေးပါပြီ\nယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် ⛏️💰`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(chatId, `❌ ${res?.error || 'Miner မတွေ့ပါ သို့မဟုတ် Error ဖြစ်သွားသည်'}`).catch(() => {});
+      await safeSend(chatId, `❌ ${res?.error || 'Miner မတွေ့ပါ သို့မဟုတ် Error ဖြစ်သွားသည်'}`);
     }
   });
 
-  // ── /reject_miner_[ID] — Text command ─────────────────────
+  // ── /reject_miner_[ID] ────────────────────────────────────
   bot.onText(/^\/reject_miner_([a-zA-Z0-9]+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const minerId = match[1];
@@ -436,102 +575,103 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/miners/reject', { minerId });
     if (res?.success) {
-      bot.sendMessage(chatId,
+      await safeSend(chatId,
         `❌ *Miner Slot #${res.slotIndex} ငြင်းဆန်ပြီးပါပြီ*\n👤 User ID: ${res.userId}`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-      bot.sendMessage(res.userId,
+      );
+      await safeSend(res.userId,
         `❌ *Miner #${res.slotIndex} ငြင်းဆန်ခံရပါသည်*\n\nScreenshot မှန်ကန်မှု စစ်ဆေးပြီး ထပ်မံ တင်ပေးပါ`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(chatId, `❌ ${res?.error || 'Miner မတွေ့ပါ'}`).catch(() => {});
+      await safeSend(chatId, `❌ ${res?.error || 'Miner မတွေ့ပါ'}`);
     }
   });
 
-  // ── /vpn — Enable VPN requirement ─────────────────────────
+  // ── /vpn ──────────────────────────────────────────────────
   bot.onText(/^\/vpn$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     const res = await backendPost('/api/admin/bot/setvpn', { enabled: true });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `🔒 *VPN Control: ဖွင့်ပြီးပါပြီ*\n\nယခုမှစ၍ မြန်မာနိုင်ငံမှ User များသည်\nTask ကြည့်ရန် VPN ဖွင့်ထားရမည်ဖြစ်သည်\n\n📴 ပိတ်ရန် /unvpn`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`);
     }
   });
 
-  // ── /unvpn — Disable VPN requirement ──────────────────────
+  // ── /unvpn ────────────────────────────────────────────────
   bot.onText(/^\/unvpn$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     const res = await backendPost('/api/admin/bot/setvpn', { enabled: false });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `🔓 *VPN Control: ပိတ်ပြီးပါပြီ*\n\nယခုမှစ၍ VPN မပါဘဲ Task ကြည့်၍ ရပါပြီ\n\n🔒 ပြန်ဖွင့်ရန် /vpn`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`);
     }
   });
 
-  // ── /setmin [amount] ───────────────────────────────────────
+  // ── /setmin [amount] ──────────────────────────────────────
   bot.onText(/^\/setmin\s+(\d+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const amount = parseInt(match[1]);
     if (amount < 1000) {
-      bot.sendMessage(msg.chat.id, '❌ အနည်းဆုံး 1,000 ကျပ် ဖြစ်ရမည်').catch(() => {});
+      await safeSend(msg.chat.id, '❌ အနည်းဆုံး 1,000 ကျပ် ဖြစ်ရမည်');
       return;
     }
     const res = await backendPost('/api/admin/bot/setmin', { amount });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *Minimum Withdrawal ပြောင်းပြီးပါပြီ*\n\n💰 အနည်းဆုံး: *${amount.toLocaleString()} ကျပ်*`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`);
     }
   });
 
-  // ── /setfee [amount] ───────────────────────────────────────
+  // ── /setfee [amount] ──────────────────────────────────────
   bot.onText(/^\/setfee\s+(\d+)$/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const amount = parseInt(match[1]);
     const res = await backendPost('/api/admin/bot/setfee', { amount });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *Withdrawal Fee ပြောင်းပြီးပါပြီ*\n\n💸 ကြေး: *${amount.toLocaleString()} ကျပ်*`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ Error: ${res?.error || 'Server error'}`);
     }
   });
 
-  // ── /settings ──────────────────────────────────────────────
+  // ── /settings ─────────────────────────────────────────────
   bot.onText(/^\/settings$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     const res = await backendGet('/api/admin/bot/getsettings');
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `⚙️ *Current Settings*\n\n` +
         `🔒 VPN Required: ${res.vpnRequired ? '✅ On' : '❌ Off'}\n` +
-        `💰 Min Withdrawal: ${(res.minWithdrawal||50000).toLocaleString()} ကျပ်\n` +
-        `💸 Withdrawal Fee: ${(res.withdrawalFee||5000).toLocaleString()} ကျပ်\n\n` +
+        `💰 Min Withdrawal: ${(res.minWithdrawal || 50000).toLocaleString()} ကျပ်\n` +
+        `💸 Withdrawal Fee: ${(res.withdrawalFee || 5000).toLocaleString()} ကျပ်\n\n` +
         `📋 *Commands:*\n` +
         `/vpn — VPN ဖွင့်\n/unvpn — VPN ပိတ်\n` +
         `/setmin [ပမာဏ] — Min ပြောင်း\n/setfee [ကြေး] — Fee ပြောင်း`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     }
   });
 
+  // ── /admin ────────────────────────────────────────────────
   bot.onText(/\/admin$/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
-    bot.sendMessage(msg.chat.id,
+    await safeSend(msg.chat.id,
       `🛠 *Admin Commands*\n\n` +
       `💰 *ငွေ*\n` +
       `/addmoney [ID] [Amount] — ငွေထည့်ရန်\n` +
@@ -543,8 +683,7 @@ function setupHandlers() {
       `/approve_miner_[ID] — Text မှ Miner Approve\n` +
       `/reject_miner_[ID] — Text မှ Miner Reject\n\n` +
       `⚙️ *Settings*\n` +
-      `/vpn — VPN ဖွင့် (MM IP ဆို Modal ပြ)\n` +
-      `/unvpn — VPN ပိတ်\n` +
+      `/vpn — VPN ဖွင့်\n/unvpn — VPN ပိတ်\n` +
       `/setmin [ပမာဏ] — Min Withdrawal ပြောင်း\n` +
       `/setfee [ကြေး] — Withdrawal Fee ပြောင်း\n` +
       `/settings — လက်ရှိ Settings ကြည့်\n\n` +
@@ -557,10 +696,10 @@ function setupHandlers() {
       `/reply [ID] [message] — User ထံ စာပြန်ရန်\n` +
       `/stats — Users/Balance Statistics`,
       { parse_mode: 'Markdown' }
-    ).catch(() => {});
+    );
   });
 
-  // /addmoney [userId] [amount]
+  // ── /addmoney [userId] [amount] ───────────────────────────
   bot.onText(/\/addmoney (\d+) (\d+)/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId = parseInt(match[1]);
@@ -568,26 +707,25 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/addmoney', { userId: targetId, amount });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *ငွေထည့်ပြီးပါပြီ*\n` +
         `👤 User: ${targetId}\n` +
         `💰 ထည့်သော ငွေ: ${amount.toLocaleString()} ကျပ်\n` +
         `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      bot.sendMessage(targetId,
+      );
+      await safeSend(targetId,
         `💰 *Admin မှ ငွေထည့်ပေးပါပြီ!*\n\n` +
         `✅ ${amount.toLocaleString()} ကျပ် သင့်အကောင့်သို့ ထည့်သွင်းပြီးပါပြီ\n` +
         `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`);
     }
   });
 
-  // /reducemoney [userId] [amount]
+  // ── /reducemoney [userId] [amount] ───────────────────────
   bot.onText(/\/reducemoney (\d+) (\d+)/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId = parseInt(match[1]);
@@ -595,26 +733,25 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/reducemoney', { userId: targetId, amount });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *ငွေနုတ်ပြီးပါပြီ*\n` +
         `👤 User: ${targetId}\n` +
         `💸 နုတ်သော ငွေ: ${amount.toLocaleString()} ကျပ်\n` +
         `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      bot.sendMessage(targetId,
+      );
+      await safeSend(targetId,
         `⚠️ *Admin မှ ငွေနုတ်ယူပါပြီ*\n\n` +
         `💸 ${amount.toLocaleString()} ကျပ် သင့်အကောင့်မှ နုတ်ယူပြီးပါပြီ\n` +
         `💳 လက်ကျန်ငွေ: ${res.newBalance?.toLocaleString()} ကျပ်`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ သို့မဟုတ် ငွေလောက်မပြည့်ပါ'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ သို့မဟုတ် ငွေလောက်မပြည့်ပါ'}`);
     }
   });
 
-  // /ban [userId] [reason]
+  // ── /ban [userId] [reason] ────────────────────────────────
   bot.onText(/\/ban (\d+)(?:\s+(.+))?/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId = parseInt(match[1]);
@@ -622,47 +759,47 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/ban', { userId: targetId, reason });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *User ${targetId} ကို Ban ချပြီးပါပြီ*\n📝 Reason: ${reason}`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      bot.sendMessage(targetId,
+      );
+      await safeSend(targetId,
         `🚫 *Account ပိတ်ထားပါသည်*\n\n` +
         `Admin မှ သင့် Account ကို ပိတ်ဆို့ထားပါသည်\n` +
         `📝 အကြောင်းပြချက်: ${reason}\n\n` +
         `ပြဿနာရှိပါက Admin ထံ ဆက်သွယ်ပါ`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`);
     }
   });
 
-  // /unban [userId]
+  // ── /unban [userId] ───────────────────────────────────────
   bot.onText(/\/unban (\d+)/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId = parseInt(match[1]);
 
     const res = await backendPost('/api/admin/bot/unban', { userId: targetId });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *User ${targetId} ကို Ban ဖြုတ်ပြီးပါပြီ*`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      bot.sendMessage(targetId,
+      );
+      // [FIX #6] — Unban လုပ်ပြီး user ကို notify
+      // User က block မထားပါက reply ရမည်၊ block ထားရင် safeSend က silently ignore
+      await safeSend(targetId,
         `✅ *Account ပြန်ဖွင့်ပေးပြီးပါပြီ!*\n\n` +
         `Admin မှ သင့် Account ကို ပြန်ဖွင့်ပေးပါပြီ\n` +
         `App ကို ပုံမှန်အသုံးပြုနိုင်ပါပြီ 🎉`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'User မတွေ့ပါ'}`);
     }
   });
 
-  // /userinfo [userId]
+  // ── /userinfo [userId] ────────────────────────────────────
   bot.onText(/\/userinfo (\d+)/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId = parseInt(match[1]);
@@ -670,7 +807,7 @@ function setupHandlers() {
     const res = await backendGet(`/api/admin/bot/userinfo/${targetId}`);
     if (res?.success && res.user) {
       const u = res.user;
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `👤 *User Info*\n\n` +
         `🆔 ID: \`${u.userId}\`\n` +
         `📛 Name: ${u.firstName || '-'}\n` +
@@ -680,50 +817,52 @@ function setupHandlers() {
         `⛏️ Miners: ${u.activeMiners || 0} active\n` +
         `📅 Joined: ${new Date(u.createdAt).toLocaleDateString('my-MM')}`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ User ${targetId} မတွေ့ပါ`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ User ${targetId} မတွေ့ပါ`);
     }
   });
 
-  // /stats
+  // ── /stats ────────────────────────────────────────────────
   bot.onText(/\/stats/, async (msg) => {
     if (msg.from.id !== ADMIN_ID) return;
     const res = await backendGet('/api/admin/stats');
     if (res) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `📊 *App Statistics*\n\n` +
         `👥 *Total Users:* ${res.totalUsers?.toLocaleString()} ယောက်\n` +
-        `💰 *Total Balance (All Users):* ${(res.totalBalance||0).toLocaleString()} ကျပ်\n` +
+        `💰 *Total Balance (All Users):* ${(res.totalBalance || 0).toLocaleString()} ကျပ်\n` +
         `⛏️ *Active Miners:* ${res.activeMiners?.toLocaleString()}\n` +
         `💸 *Pending Withdrawals:* ${res.pendingWithdrawals}\n` +
         `⏳ *Pending Miners:* ${res.pendingMiners?.length || 0}`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     }
   });
 
-  // /reply [userId] [message]
+  // ── /reply [userId] [message] ─────────────────────────────
   bot.onText(/\/reply (\d+) (.+)/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId = parseInt(match[1]);
     const text     = match[2];
-    try {
-      await bot.sendMessage(targetId,
-        `📨 *Admin ထံမှ အကြောင်းပြန်စာ*\n\n${text}`,
-        { parse_mode: 'Markdown' }
-      );
-      bot.sendMessage(msg.chat.id, `✅ User ${targetId} ထံ စာပြန်ပြီးပါပြီ`).catch(() => {});
-    } catch {
-      bot.sendMessage(msg.chat.id, `❌ ပို့မရပါ — User က Bot ကို Block ထားနိုင်သည်`).catch(() => {});
+
+    const result = await safeSend(targetId,
+      `📨 *Admin ထံမှ အကြောင်းပြန်စာ*\n\n${text}`,
+      { parse_mode: 'Markdown' }
+    );
+
+    if (result) {
+      await safeSend(msg.chat.id, `✅ User ${targetId} ထံ စာပြန်ပြီးပါပြီ`);
+    } else {
+      await safeSend(msg.chat.id, `❌ ပို့မရပါ — User က Bot ကို Block ထားနိုင်သည်`);
     }
   });
 
-  // /broadcast [message]
+  // ── /broadcast [message] ──────────────────────────────────
   bot.onText(/\/broadcast (.+)/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const text = match[1];
-    bot.sendMessage(msg.chat.id, '📢 Broadcast စတင်မည်...').catch(() => {});
+    await safeSend(msg.chat.id, '📢 Broadcast စတင်မည်...');
 
     const data  = await backendGet('/api/admin/users');
     const users = data?.users || [];
@@ -732,19 +871,19 @@ function setupHandlers() {
     for (let i = 0; i < users.length; i += 30) {
       const batch = users.slice(i, i + 30);
       await Promise.all(batch.map(async u => {
-        try {
-          await bot.sendMessage(u.userId, text, { parse_mode: 'HTML' });
-          ok++;
-        } catch { fail++; }
+        // [FIX #6] safeSend သုံး — blocked user တွေကြောင့် crash မဖြစ်ရန်
+        const r = await safeSend(u.userId, text, { parse_mode: 'HTML' });
+        if (r) ok++; else fail++;
       }));
       if (i + 30 < users.length) await sleep(2000);
     }
-    bot.sendMessage(msg.chat.id,
-      `✅ Broadcast ပြီးပါပြီ\n📤 Sent: ${ok}\n❌ Failed: ${fail}`
-    ).catch(() => {});
+
+    await safeSend(msg.chat.id,
+      `✅ Broadcast ပြီးပါပြီ\n📤 Sent: ${ok}\n❌ Failed/Blocked: ${fail}`
+    );
   });
 
-  // /miner [userId] [miner1/miner2/miner3]
+  // ── /miner [userId] [miner1/miner2/miner3] ───────────────
   bot.onText(/\/miner (\d+) (miner[123])/i, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId  = parseInt(match[1]);
@@ -752,25 +891,24 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/giveminer', { userId: targetId, slotIndex });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *Miner ${match[2].toUpperCase()} ပေးပြီးပါပြီ*\n` +
         `👤 User ID: ${targetId}\n` +
         `⛏️ Slot #${slotIndex} ယခု Active ဖြစ်ပြီ!`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      bot.sendMessage(targetId,
+      );
+      await safeSend(targetId,
         `🎁 *Admin မှ Miner ပေးပါပြီ!*\n\n` +
         `⛏️ *Slot #${slotIndex}* သင့်အတွက် Activate ပြုလုပ်ပြီးပါပြီ\n` +
         `ယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရရှိနေပါမည်! 💰`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'Error ဖြစ်သွားသည်'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'Error ဖြစ်သွားသည်'}`);
     }
   });
 
-  // /giveminer [userId] [slot]
+  // ── /giveminer [userId] [slot] ────────────────────────────
   bot.onText(/\/giveminer (\d+) ([123])/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId  = parseInt(match[1]);
@@ -778,25 +916,24 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/giveminer', { userId: targetId, slotIndex });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *Miner Slot #${slotIndex} ပေးပြီးပါပြီ*\n` +
         `👤 User: ${targetId}\n` +
         `⛏️ Slot #${slotIndex} Active ဖြစ်ပြီ!`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      bot.sendMessage(targetId,
+      );
+      await safeSend(targetId,
         `🎁 *Admin မှ Miner ပေးပါပြီ!*\n\n` +
         `⛏️ *Slot #${slotIndex}* သင့်အတွက် Activate ပြုလုပ်ပြီးပါပြီ\n` +
         `ယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် Auto ရရှိနေပါမည်! 💰`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'Error ဖြစ်သွားသည်'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'Error ဖြစ်သွားသည်'}`);
     }
   });
 
-  // /revokeminer [userId] [slot]
+  // ── /revokeminer [userId] [slot] ──────────────────────────
   bot.onText(/\/revokeminer (\d+) ([123])/, async (msg, match) => {
     if (msg.from.id !== ADMIN_ID) return;
     const targetId  = parseInt(match[1]);
@@ -804,73 +941,66 @@ function setupHandlers() {
 
     const res = await backendPost('/api/admin/bot/revokeminer', { userId: targetId, slotIndex });
     if (res?.success) {
-      bot.sendMessage(msg.chat.id,
+      await safeSend(msg.chat.id,
         `✅ *Miner Slot #${slotIndex} ဖြုတ်ပြီးပါပြီ*\n👤 User: ${targetId}`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      );
     } else {
-      bot.sendMessage(msg.chat.id, `❌ ${res?.error || 'Miner မတွေ့ပါ'}`).catch(() => {});
+      await safeSend(msg.chat.id, `❌ ${res?.error || 'Miner မတွေ့ပါ'}`);
     }
   });
 
-  // ── Non-command messages ────────────────────────────────────
+  // ── Non-command messages (Support forward) ────────────────
   bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    if (userId === ADMIN_ID) return;
+    const userId = msg.from?.id;
+    if (!userId || userId === ADMIN_ID) return;
     if (msg.text?.startsWith('/')) return;
+    // my_chat_member etc non-message updates ကို skip
+    if (!msg.text && !msg.photo && !msg.document) return;
 
     if (msg.text) {
-      bot.sendMessage(ADMIN_ID,
+      await safeSend(ADMIN_ID,
         `📩 *Support Message*\n\n` +
         `👤 *${msg.from.first_name || ''}* (${userId})\n` +
         `💬 ${msg.text}\n\n` +
         `_Reply: /reply ${userId} <message>_`,
         { parse_mode: 'Markdown' }
-      ).catch(() => {});
-      bot.sendMessage(chatId, '✅ Admin ထံ ပို့ပြီးပါပြီ').catch(() => {});
+      );
+      await safeSend(chatId, '✅ Admin ထံ ပို့ပြီးပါပြီ');
     }
   });
 
-  // ============================================================
-  //  [FIX #4] POLLING ERROR HANDLER — ERROR အားလုံး HANDLE လုပ်
-  //  403 (user blocked)  → log ထုတ်ပြီး polling ဆက်
-  //  409 (conflict)      → webhook ရှင်းပြီး restart
-  //  Network/Other error → exponential backoff ဖြင့် restart
-  // ============================================================
+  // ── Polling Error Handler ─────────────────────────────────
   bot.on('polling_error', (err) => {
     const errMsg  = err.message || '';
     const errCode = err.code   || '';
 
-    // 403 Forbidden — User က Bot ကို Block လုပ်ထားတာကြောင့် ဖြစ်သော Error
-    // Polling ကိုမထိဘဲ log ထုတ်ပြီး ဆက်သွားမည်
+    // [FIX #4] 403 Forbidden — User block ကြောင့် မဟုတ်ဘဲ token ပြဿနာ ဖြစ်ရင်
+    // Polling မရပ်ဘဲ log ထုတ်ပြီး ဆက်
     if (errMsg.includes('403') || errMsg.includes('Forbidden')) {
-      console.warn(`⚠️  [polling_error] 403 Forbidden — User blocked bot (polling continues): ${errMsg}`);
+      console.warn(`⚠️  [polling_error] 403 Forbidden — polling continues: ${errMsg}`);
       return;
     }
 
-    // 404 — Invalid token
     if (errMsg.includes('404')) {
-      console.error('❌ [polling_error] 404 — BOT_TOKEN မမှန်ပါ! Manual check လုပ်ပါ။');
+      console.error('❌ [polling_error] 404 — BOT_TOKEN မမှန်ပါ!');
       return;
     }
 
-    // 409 Conflict — webhook ရှင်းပြီး restart
     if (errMsg.includes('409') || errCode === 'ETELEGRAM') {
       console.error(`⚠️  [polling_error] 409 Conflict — restarting: ${errMsg}`);
       restartBot('409_conflict');
       return;
     }
 
-    // Network errors (ECONNRESET, ETIMEDOUT, ENOTFOUND, etc.)
-    // ဒီ Error များဖြစ်ရင် polling ရပ်သွားနိုင်လို့ restart လုပ်မည်
     if (
-      errCode === 'ECONNRESET'  ||
-      errCode === 'ETIMEDOUT'   ||
-      errCode === 'ENOTFOUND'   ||
-      errCode === 'ECONNREFUSED'||
-      errMsg.includes('network')  ||
-      errMsg.includes('timeout')  ||
+      errCode === 'ECONNRESET'   ||
+      errCode === 'ETIMEDOUT'    ||
+      errCode === 'ENOTFOUND'    ||
+      errCode === 'ECONNREFUSED' ||
+      errMsg.includes('network') ||
+      errMsg.includes('timeout') ||
       errMsg.includes('EFATAL')
     ) {
       console.error(`⚠️  [polling_error] Network error [${errCode}]: ${errMsg} — restarting...`);
@@ -878,34 +1008,15 @@ function setupHandlers() {
       return;
     }
 
-    // Unknown errors — log ထုတ်ပြီး restart
-    console.error(`⚠️  [polling_error] Unknown error [${errCode}]: ${errMsg} — restarting...`);
+    console.error(`⚠️  [polling_error] Unknown [${errCode}]: ${errMsg} — restarting...`);
     restartBot(`unknown_error_${errCode}`);
   });
 
-  // ============================================================
-  //  [FIX #5] POLLING WATCHDOG — 5 မိနစ်တိုင်း getMe() စစ်ဆေး
-  //  Bot silent ရပ်သွားရင် auto restart လုပ်မည်
-  // ============================================================
-  const watchdogInterval = setInterval(async () => {
-    if (!bot || !isPolling || isRestarting) return;
-    try {
-      await bot.getMe();
-      // getMe() အောင်ရင် polling ကောင်းနေသည်
-    } catch (e) {
-      console.error('🔍 Watchdog: getMe() failed — bot may be down:', e.message);
-      clearInterval(watchdogInterval);
-      if (!isRestarting) {
-        restartBot('watchdog_getme_failed');
-      }
-    }
-  }, 5 * 60 * 1000); // 5 minutes
-
-  console.log('✅ All handlers registered. Watchdog active.');
+  console.log('✅ All handlers registered.');
 }
 
 // ============================================================
-//  EXPRESS SERVER  —  Backend မှ ခေါ်သော Endpoints
+//  EXPRESS SERVER
 // ============================================================
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -917,10 +1028,11 @@ app.get('/status', (_req, res) => res.json({
   polling: isPolling,
   restarting: isRestarting,
   restartAttempts,
+  lastUpdateAgo: Math.round((Date.now() - lastUpdateTime) / 1000) + 's',
   ts: Date.now()
 }));
 
-// ── Backend calls bot to notify admin with inline buttons ──
+// ── Backend → Admin: Miner purchase screenshot ────────────
 app.post('/send-miner-photo', async (req, res) => {
   if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
   const { userId, firstName, minerId, slotIndex, amount, screenshotBase64 } = req.body;
@@ -942,8 +1054,8 @@ app.post('/send-miner-photo', async (req, res) => {
 
   const inlineKeyboard = {
     inline_keyboard: [[
-      { text: '✅ Approve',  callback_data: `miner_approve_${minerId}_${userId}_${slotIndex}` },
-      { text: '❌ Reject',   callback_data: `miner_reject_${minerId}_${userId}_${slotIndex}` }
+      { text: '✅ Approve', callback_data: `miner_approve_${minerId}_${userId}_${slotIndex}` },
+      { text: '❌ Reject',  callback_data: `miner_reject_${minerId}_${userId}_${slotIndex}` }
     ]]
   };
 
@@ -955,12 +1067,12 @@ app.post('/send-miner-photo', async (req, res) => {
       reply_markup: inlineKeyboard
     });
 
-    await bot.sendMessage(parseInt(userId),
+    await safeSend(parseInt(userId),
       `⏳ *Miner ဝယ်ယူမှု လက်ခံပြီးပါပြီ!*\n\n` +
       `Screenshot ကို Admin ထံ တိုက်ရိုက်ပို့ပြီးပါပြီ\n` +
       `မကြာမီ Admin စစ်ဆေးပြီး Activate ပေးပါမည် 🙏`,
       { parse_mode: 'Markdown' }
-    ).catch(() => {});
+    );
 
     res.json({ success: true });
   } catch (e) {
@@ -969,7 +1081,7 @@ app.post('/send-miner-photo', async (req, res) => {
   }
 });
 
-// ── Backend calls bot to forward withdrawal fee screenshot to admin ──
+// ── Backend → Admin: Withdrawal screenshot ────────────────
 app.post('/send-withdrawal-photo', async (req, res) => {
   if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
   const { userId, firstName, withdrawalId, amount, method, accountNumber, accountName, screenshotBase64 } = req.body;
@@ -1007,41 +1119,50 @@ app.post('/send-withdrawal-photo', async (req, res) => {
   }
 });
 
-// ── Generic user notification ─────────────────────────────────
+// ── Generic user notification ─────────────────────────────
 app.post('/notify-user', async (req, res) => {
   if (!bot || !isPolling) return res.status(503).json({ error: 'Bot not ready' });
   const { userId, message } = req.body;
   if (!userId || !message) return res.status(400).json({ error: 'Missing fields' });
 
-  try {
-    await bot.sendMessage(parseInt(userId), message, { parse_mode: 'Markdown' });
+  const result = await safeSend(parseInt(userId), message, { parse_mode: 'Markdown' });
+  if (result) {
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } else {
+    res.status(500).json({ error: 'Failed to send (user may have blocked bot)' });
   }
 });
 
-// ── Error handler ──────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error('Express error:', err.message);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ── Start ──────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
 initializeBot().then(() => {
   app.listen(PORT, () => {
     console.log(`
-╔══════════════════════════════════════════╗
-║  ⛏️  Kyaw Ngar Mining Bot  —  Ready!     ║
-╠══════════════════════════════════════════╣
-║  Port: ${String(PORT).padEnd(34)}║
-║  Admin: ${String(ADMIN_ID).padEnd(33)}║
-║  Block/Unblock Fix ✅  Watchdog ✅       ║
-╚══════════════════════════════════════════╝`);
+╔══════════════════════════════════════════════════╗
+║  ⛏️  Kyaw Ngar Mining Bot  —  Ready! (v2 Fixed) ║
+╠══════════════════════════════════════════════════╣
+║  Port: ${String(PORT).padEnd(42)}║
+║  Admin: ${String(ADMIN_ID).padEnd(41)}║
+║  ✅ Block/Unblock Fix    ✅ Watchdog Leak Fix    ║
+║  ✅ MAX_RESTART Fix      ✅ Polling Death Fix    ║
+║  ✅ my_chat_member Fix   ✅ safeSend Fix         ║
+╚══════════════════════════════════════════════════╝`);
   });
 }).catch(e => { console.error('Startup failed:', e); process.exit(1); });
 
-process.once('SIGINT',  () => { if (bot) bot.stopPolling(); process.exit(0); });
-process.once('SIGTERM', () => { if (bot) bot.stopPolling(); process.exit(0); });
+process.once('SIGINT',  () => {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  if (bot) bot.stopPolling();
+  process.exit(0);
+});
+process.once('SIGTERM', () => {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  if (bot) bot.stopPolling();
+  process.exit(0);
+});
